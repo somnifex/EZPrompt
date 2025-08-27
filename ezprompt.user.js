@@ -1,0 +1,9920 @@
+// ==UserScript==
+// @name         EZPrompt - AI Chat Prompt Manager
+// @namespace    https://github.com/somnifex/EZPrompt
+// @version      1.0.0
+// @description  Quick prompt insertion for AI chat websites with local storage and WebDAV sync
+// @author       EZPrompt Team
+// @match        https://chat.openai.com/*
+// @match        https://chatgpt.com/*
+// @match        https://claude.ai/*
+// @match        https://gemini.google.com/*
+// @match        https://chat.deepseek.com/*
+// @match        https://tongyi.aliyun.com/*
+// @match        https://qwen.alibaba.com/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_deleteValue
+// @grant        GM_listValues
+// @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
+// @grant        GM_notification
+// @grant        GM_openInTab
+// @grant        GM_setClipboard
+// @run-at       document-start
+// @updateURL    https://raw.githubusercontent.com/somnifex/EZPrompt/main/ezprompt.user.js
+// @downloadURL  https://raw.githubusercontent.com/somnifex/EZPrompt/main/ezprompt.user.js
+// @supportURL   https://github.com/somnifex/EZPrompt/issues
+// @homepageURL  https://github.com/somnifex/EZPrompt
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // Namespace isolation to prevent conflicts
+    const EZPrompt = {
+        version: '1.0.0',
+        debug: false, // Set to false for production
+        initialized: false,
+        modules: {},
+        // Performance optimization caches
+        cache: {
+            domElements: new WeakMap(),
+            searchResults: new Map(),
+            compiledTemplates: new Map(),
+            selectorValidation: new Map()
+        },
+        // Lazy loading registry
+        lazyModules: new Map(),
+        // Memory management
+        cleanup: {
+            intervals: new Set(),
+            timeouts: new Set(),
+            observers: new Set(),
+            eventListeners: new Set()
+        }
+    };
+
+    // Performance-optimized utilities
+    class PerformanceUtils {
+        static debounce(func, wait, immediate = false) {
+            let timeout;
+            return function executedFunction(...args) {
+                const later = () => {
+                    timeout = null;
+                    if (!immediate) func.apply(this, args);
+                };
+                const callNow = immediate && !timeout;
+                clearTimeout(timeout);
+                timeout = setTimeout(later, wait);
+                EZPrompt.cleanup.timeouts.add(timeout);
+                if (callNow) func.apply(this, args);
+            };
+        }
+
+        static throttle(func, limit) {
+            let inThrottle;
+            return function (...args) {
+                if (!inThrottle) {
+                    func.apply(this, args);
+                    inThrottle = true;
+                    const timeout = setTimeout(() => inThrottle = false, limit);
+                    EZPrompt.cleanup.timeouts.add(timeout);
+                }
+            };
+        }
+
+        static memoize(fn, keyGenerator = (...args) => JSON.stringify(args)) {
+            const cache = new Map();
+            return function (...args) {
+                const key = keyGenerator(...args);
+                if (cache.has(key)) {
+                    return cache.get(key);
+                }
+                const result = fn.apply(this, args);
+                cache.set(key, result);
+                // Limit cache size to prevent memory leaks
+                if (cache.size > 1000) {
+                    const firstKey = cache.keys().next().value;
+                    cache.delete(firstKey);
+                }
+                return result;
+            };
+        }
+
+        static createLazyLoader(moduleFactory) {
+            let instance = null;
+            let loading = false;
+            let loadPromise = null;
+
+            return async function () {
+                if (instance) return instance;
+                if (loading) return loadPromise;
+
+                loading = true;
+                loadPromise = (async () => {
+                    try {
+                        instance = await moduleFactory();
+                        return instance;
+                    } finally {
+                        loading = false;
+                    }
+                })();
+
+                return loadPromise;
+            };
+        }
+
+        static batchDOMUpdates(updates) {
+            return new Promise(resolve => {
+                requestAnimationFrame(() => {
+                    updates.forEach(update => update());
+                    resolve();
+                });
+            });
+        }
+
+        static measurePerformance(name, fn) {
+            if (!EZPrompt.debug) return fn();
+
+            const start = performance.now();
+            const result = fn();
+            const end = performance.now();
+            console.log(`[Performance] ${name}: ${(end - start).toFixed(2)}ms`);
+            return result;
+        }
+    }
+
+    // Core logging and error handling utilities
+    class Logger {
+        constructor(prefix = 'EZPrompt') {
+            this.prefix = prefix;
+            this.levels = {
+                ERROR: 0,
+                WARN: 1,
+                INFO: 2,
+                DEBUG: 3
+            };
+            this.currentLevel = EZPrompt.debug ? this.levels.DEBUG : this.levels.INFO;
+            this.logBuffer = [];
+            this.maxBufferSize = 100;
+        }
+
+        _log(level, levelName, ...args) {
+            if (level <= this.currentLevel) {
+                const timestamp = new Date().toISOString();
+                const message = `[${timestamp}] [${this.prefix}:${levelName}]`;
+
+                // Buffer logs for performance in production
+                if (!EZPrompt.debug && level > this.levels.WARN) {
+                    this.logBuffer.push({ level, levelName, message, args, timestamp });
+                    if (this.logBuffer.length > this.maxBufferSize) {
+                        this.logBuffer.shift();
+                    }
+                } else {
+                    console[levelName.toLowerCase()](message, ...args);
+                }
+            }
+        }
+
+        flushLogs() {
+            this.logBuffer.forEach(log => {
+                console[log.levelName.toLowerCase()](log.message, ...log.args);
+            });
+            this.logBuffer = [];
+        }
+
+        error(...args) {
+            this._log(this.levels.ERROR, 'ERROR', ...args);
+        }
+
+        warn(...args) {
+            this._log(this.levels.WARN, 'WARN', ...args);
+        }
+
+        info(...args) {
+            this._log(this.levels.INFO, 'INFO', ...args);
+        }
+
+        debug(...args) {
+            this._log(this.levels.DEBUG, 'DEBUG', ...args);
+        }
+    }
+
+    // Enhanced error handler with comprehensive error handling and user feedback
+    class ErrorHandler {
+        constructor(logger) {
+            this.logger = logger;
+            this.notificationSystem = null;
+            this.errorQueue = [];
+            this.retryAttempts = new Map();
+            this.maxRetries = 3;
+            this.setupGlobalHandlers();
+        }
+
+        setNotificationSystem(notificationSystem) {
+            this.notificationSystem = notificationSystem;
+        }
+
+        setupGlobalHandlers() {
+            // Handle uncaught errors
+            window.addEventListener('error', (event) => {
+                this.handleError(event.error, 'Uncaught Error', {
+                    filename: event.filename,
+                    lineno: event.lineno,
+                    colno: event.colno
+                });
+            });
+
+            // Handle unhandled promise rejections
+            window.addEventListener('unhandledrejection', (event) => {
+                this.handleError(event.reason, 'Unhandled Promise Rejection');
+                event.preventDefault(); // Prevent console error
+            });
+        }
+
+        handleError(error, context = 'Unknown', metadata = {}, showNotification = true) {
+            const errorInfo = {
+                id: this.generateErrorId(),
+                message: error?.message || String(error),
+                stack: error?.stack,
+                context,
+                metadata,
+                timestamp: new Date().toISOString(),
+                userAgent: navigator.userAgent,
+                url: window.location.href,
+                severity: this.determineSeverity(error, context)
+            };
+
+            this.logger.error('Error occurred:', errorInfo);
+
+            // Store error for debugging
+            this.storeError(errorInfo);
+
+            // Show user notification based on severity and context
+            if (showNotification && this.shouldShowNotification(errorInfo)) {
+                this.showErrorNotification(errorInfo);
+            }
+
+            // Handle graceful degradation
+            this.handleGracefulDegradation(errorInfo);
+
+            return errorInfo;
+        }
+
+        generateErrorId() {
+            return 'err_' + Math.random().toString(36).substring(2, 11) + '_' + Date.now();
+        }
+
+        determineSeverity(error, context) {
+            // Critical errors that break core functionality
+            if (context.includes('Initialization') ||
+                context.includes('Storage') ||
+                context.includes('Core')) {
+                return 'critical';
+            }
+
+            // High severity for network and sync issues
+            if (context.includes('Network') ||
+                context.includes('Sync') ||
+                context.includes('WebDAV')) {
+                return 'high';
+            }
+
+            // Medium severity for UI and template issues
+            if (context.includes('UI') ||
+                context.includes('Template') ||
+                context.includes('DOM')) {
+                return 'medium';
+            }
+
+            // Low severity for validation and minor issues
+            return 'low';
+        }
+
+        shouldShowNotification(errorInfo) {
+            // Always show critical and high severity errors
+            if (errorInfo.severity === 'critical' || errorInfo.severity === 'high') {
+                return true;
+            }
+
+            // Show medium severity errors but not too frequently
+            if (errorInfo.severity === 'medium') {
+                const recentErrors = this.getRecentErrors(5 * 60 * 1000); // Last 5 minutes
+                const similarErrors = recentErrors.filter(e =>
+                    e.context === errorInfo.context && e.severity === 'medium'
+                );
+                return similarErrors.length < 3; // Max 3 similar errors in 5 minutes
+            }
+
+            // Don't show low severity errors to users
+            return false;
+        }
+
+        showErrorNotification(errorInfo) {
+            if (!this.notificationSystem) return;
+
+            let message, type;
+
+            switch (errorInfo.severity) {
+                case 'critical':
+                    message = `Critical error: ${this.getUserFriendlyMessage(errorInfo)}`;
+                    type = 'error';
+                    break;
+                case 'high':
+                    message = `Error: ${this.getUserFriendlyMessage(errorInfo)}`;
+                    type = 'error';
+                    break;
+                case 'medium':
+                    message = `Warning: ${this.getUserFriendlyMessage(errorInfo)}`;
+                    type = 'warning';
+                    break;
+                default:
+                    return; // Don't show low severity errors
+            }
+
+            this.notificationSystem.show(message, type, {
+                duration: errorInfo.severity === 'critical' ? 10000 : 5000,
+                persistent: errorInfo.severity === 'critical'
+            });
+        }
+
+        getUserFriendlyMessage(errorInfo) {
+            const contextMessages = {
+                'Network Error': 'Connection failed. Please check your internet connection.',
+                'WebDAV Sync': 'Sync failed. Working offline with local data.',
+                'Storage Error': 'Failed to save data. Please try again.',
+                'Template Error': 'Invalid template format. Please check your prompt.',
+                'DOM Error': 'Page element not found. The website may have changed.',
+                'Import Error': 'Failed to import data. Please check the file format.',
+                'Export Error': 'Failed to export data. Please try again.',
+                'Configuration Error': 'Invalid configuration. Please check your settings.',
+                'Validation Error': 'Invalid input. Please check your data.'
+            };
+
+            for (const [context, message] of Object.entries(contextMessages)) {
+                if (errorInfo.context.includes(context)) {
+                    return message;
+                }
+            }
+
+            return 'An unexpected error occurred. Please try again.';
+        }
+
+        handleGracefulDegradation(errorInfo) {
+            switch (errorInfo.context) {
+                case 'Network Error':
+                case 'WebDAV Sync':
+                    this.enableOfflineMode();
+                    break;
+                case 'Storage Error':
+                    this.fallbackToMemoryStorage();
+                    break;
+                case 'DOM Error':
+                    this.retryDOMOperation(errorInfo);
+                    break;
+                case 'Template Error':
+                    this.useDefaultTemplate(errorInfo);
+                    break;
+            }
+        }
+
+        enableOfflineMode() {
+            this.logger.info('Enabling offline mode due to network errors');
+            if (this.notificationSystem) {
+                this.notificationSystem.show(
+                    'Working offline. Changes will sync when connection is restored.',
+                    'info',
+                    { duration: 5000 }
+                );
+            }
+        }
+
+        fallbackToMemoryStorage() {
+            this.logger.warn('Falling back to memory storage due to storage errors');
+            // Implementation would depend on storage manager
+        }
+
+        retryDOMOperation(errorInfo) {
+            const operationId = `${errorInfo.context}_${errorInfo.metadata.selector || 'unknown'}`;
+            const attempts = this.retryAttempts.get(operationId) || 0;
+
+            if (attempts < this.maxRetries) {
+                this.retryAttempts.set(operationId, attempts + 1);
+                this.logger.info(`Retrying DOM operation (attempt ${attempts + 1}/${this.maxRetries})`);
+
+                // Schedule retry with exponential backoff
+                setTimeout(() => {
+                    // The actual retry would be handled by the calling code
+                    this.logger.debug(`Retry scheduled for ${operationId}`);
+                }, Math.pow(2, attempts) * 1000);
+            } else {
+                this.logger.error(`Max retries exceeded for DOM operation: ${operationId}`);
+                this.retryAttempts.delete(operationId);
+            }
+        }
+
+        useDefaultTemplate(errorInfo) {
+            this.logger.warn('Using default template due to template error');
+            // Return a safe default template
+            return errorInfo.metadata.fallback || '{content}';
+        }
+
+        storeError(errorInfo) {
+            try {
+                const errors = JSON.parse(GM_getValue('ezprompt_errors', '[]'));
+                errors.push(errorInfo);
+
+                // Keep only last 100 errors
+                if (errors.length > 100) {
+                    errors.splice(0, errors.length - 100);
+                }
+
+                GM_setValue('ezprompt_errors', JSON.stringify(errors));
+            } catch (storageError) {
+                this.logger.error('Failed to store error:', storageError);
+            }
+        }
+
+        getRecentErrors(timeWindow = 60000) {
+            try {
+                const errors = JSON.parse(GM_getValue('ezprompt_errors', '[]'));
+                const cutoff = Date.now() - timeWindow;
+                return errors.filter(error =>
+                    new Date(error.timestamp).getTime() > cutoff
+                );
+            } catch (error) {
+                this.logger.error('Failed to retrieve recent errors:', error);
+                return [];
+            }
+        }
+
+        // Specialized error handlers
+        handleNetworkError(error, operation, showNotification = true) {
+            return this.handleError(error, 'Network Error', {
+                operation,
+                retryable: true,
+                fallback: 'offline_mode'
+            }, showNotification);
+        }
+
+        handleDOMError(error, selector, showNotification = false) {
+            return this.handleError(error, 'DOM Error', {
+                selector,
+                retryable: true,
+                fallback: 'alternative_selector'
+            }, showNotification);
+        }
+
+        handleDataError(error, data, showNotification = true) {
+            return this.handleError(error, 'Data Error', {
+                dataType: typeof data,
+                dataLength: data?.length,
+                retryable: false
+            }, showNotification);
+        }
+
+        handleTemplateError(error, template, showNotification = true) {
+            return this.handleError(error, 'Template Error', {
+                template: template?.substring(0, 100) + '...',
+                retryable: false,
+                fallback: '{content}'
+            }, showNotification);
+        }
+
+        handleStorageError(error, operation, showNotification = true) {
+            return this.handleError(error, 'Storage Error', {
+                operation,
+                retryable: true,
+                fallback: 'memory_storage'
+            }, showNotification);
+        }
+
+        handleSyncError(error, operation, showNotification = true) {
+            return this.handleError(error, 'WebDAV Sync', {
+                operation,
+                retryable: true,
+                fallback: 'offline_mode'
+            }, showNotification);
+        }
+
+        handleValidationError(error, field, value, showNotification = true) {
+            return this.handleError(error, 'Validation Error', {
+                field,
+                value: typeof value === 'string' ? value.substring(0, 50) : String(value),
+                retryable: false
+            }, showNotification);
+        }
+
+        handleConfigurationError(error, config, showNotification = true) {
+            return this.handleError(error, 'Configuration Error', {
+                config: config?.name || 'unknown',
+                retryable: false
+            }, showNotification);
+        }
+
+        handleImportError(error, filename, showNotification = true) {
+            return this.handleError(error, 'Import Error', {
+                filename,
+                retryable: false
+            }, showNotification);
+        }
+
+        handleExportError(error, format, showNotification = true) {
+            return this.handleError(error, 'Export Error', {
+                format,
+                retryable: true
+            }, showNotification);
+        }
+
+        // Debug and reporting methods
+        getErrorReport() {
+            try {
+                const errors = JSON.parse(GM_getValue('ezprompt_errors', '[]'));
+                const report = {
+                    total: errors.length,
+                    recent: this.getRecentErrors(24 * 60 * 60 * 1000).length, // Last 24 hours
+                    bySeverity: {},
+                    byContext: {},
+                    topErrors: {}
+                };
+
+                errors.forEach(error => {
+                    // Count by severity
+                    report.bySeverity[error.severity] = (report.bySeverity[error.severity] || 0) + 1;
+
+                    // Count by context
+                    report.byContext[error.context] = (report.byContext[error.context] || 0) + 1;
+
+                    // Count top error messages
+                    const key = error.message.substring(0, 50);
+                    report.topErrors[key] = (report.topErrors[key] || 0) + 1;
+                });
+
+                return report;
+            } catch (error) {
+                this.logger.error('Failed to generate error report:', error);
+                return null;
+            }
+        }
+
+        clearErrorHistory() {
+            try {
+                GM_setValue('ezprompt_errors', '[]');
+                this.logger.info('Error history cleared');
+                return true;
+            } catch (error) {
+                this.logger.error('Failed to clear error history:', error);
+                return false;
+            }
+        }
+
+        exportErrorLog() {
+            try {
+                const errors = JSON.parse(GM_getValue('ezprompt_errors', '[]'));
+                const report = this.getErrorReport();
+
+                const exportData = {
+                    generated: new Date().toISOString(),
+                    version: EZPrompt.version,
+                    summary: report,
+                    errors: errors
+                };
+
+                return JSON.stringify(exportData, null, 2);
+            } catch (error) {
+                this.logger.error('Failed to export error log:', error);
+                return null;
+            }
+        }
+    }
+
+    // Lazy loading manager for UI components
+    class LazyLoadManager {
+        constructor(logger) {
+            this.logger = logger;
+            this.loadedComponents = new Set();
+            this.loadingPromises = new Map();
+            this.componentFactories = new Map();
+        }
+
+        registerComponent(name, factory, dependencies = []) {
+            this.componentFactories.set(name, { factory, dependencies });
+            this.logger.debug(`Registered lazy component: ${name}`);
+        }
+
+        async loadComponent(name) {
+            if (this.loadedComponents.has(name)) {
+                return EZPrompt.modules[name];
+            }
+
+            if (this.loadingPromises.has(name)) {
+                return this.loadingPromises.get(name);
+            }
+
+            const componentInfo = this.componentFactories.get(name);
+            if (!componentInfo) {
+                throw new Error(`Component ${name} not registered`);
+            }
+
+            const loadPromise = this._loadComponentWithDependencies(name, componentInfo);
+            this.loadingPromises.set(name, loadPromise);
+
+            try {
+                const component = await loadPromise;
+                this.loadedComponents.add(name);
+                this.loadingPromises.delete(name);
+                return component;
+            } catch (error) {
+                this.loadingPromises.delete(name);
+                throw error;
+            }
+        }
+
+        async _loadComponentWithDependencies(name, componentInfo) {
+            // Load dependencies first
+            const dependencies = {};
+            for (const depName of componentInfo.dependencies) {
+                dependencies[depName] = await this.loadComponent(depName);
+            }
+
+            this.logger.debug(`Loading component: ${name}`);
+            const startTime = performance.now();
+
+            const component = await componentInfo.factory(dependencies);
+            EZPrompt.modules[name] = component;
+
+            const loadTime = performance.now() - startTime;
+            this.logger.debug(`Component ${name} loaded in ${loadTime.toFixed(2)}ms`);
+
+            return component;
+        }
+
+        isLoaded(name) {
+            return this.loadedComponents.has(name);
+        }
+
+        unloadComponent(name) {
+            if (this.loadedComponents.has(name)) {
+                const component = EZPrompt.modules[name];
+                if (component && typeof component.cleanup === 'function') {
+                    component.cleanup();
+                }
+                delete EZPrompt.modules[name];
+                this.loadedComponents.delete(name);
+                this.logger.debug(`Component ${name} unloaded`);
+            }
+        }
+    }
+
+    // Module registry for managing components
+    class ModuleRegistry {
+        constructor(logger) {
+            this.logger = logger;
+            this.modules = new Map();
+            this.dependencies = new Map();
+            this.lazyLoader = new LazyLoadManager(logger);
+        }
+
+        register(name, moduleClass, dependencies = []) {
+            if (this.modules.has(name)) {
+                this.logger.warn(`Module ${name} already registered, overwriting`);
+            }
+
+            this.modules.set(name, {
+                class: moduleClass,
+                instance: null,
+                dependencies,
+                initialized: false
+            });
+
+            this.dependencies.set(name, dependencies);
+            this.logger.debug(`Registered module: ${name}`);
+        }
+
+        async initialize(name) {
+            const module = this.modules.get(name);
+            if (!module) {
+                throw new Error(`Module ${name} not found`);
+            }
+
+            if (module.initialized) {
+                return module.instance;
+            }
+
+            // Initialize dependencies first
+            const deps = {};
+            for (const depName of module.dependencies) {
+                deps[depName] = await this.initialize(depName);
+            }
+
+            try {
+                this.logger.debug(`Initializing module: ${name}`);
+                module.instance = new module.class(deps);
+
+                if (typeof module.instance.initialize === 'function') {
+                    await module.instance.initialize();
+                }
+
+                module.initialized = true;
+                this.logger.debug(`Module ${name} initialized successfully`);
+
+                return module.instance;
+            } catch (error) {
+                this.logger.error(`Failed to initialize module ${name}:`, error);
+                throw error;
+            }
+        }
+
+        get(name) {
+            const module = this.modules.get(name);
+            return module?.instance || null;
+        }
+
+        async initializeAll() {
+            const moduleNames = Array.from(this.modules.keys());
+            const results = {};
+
+            for (const name of moduleNames) {
+                try {
+                    results[name] = await this.initialize(name);
+                } catch (error) {
+                    this.logger.error(`Failed to initialize module ${name}:`, error);
+                    results[name] = null;
+                }
+            }
+
+            return results;
+        }
+    }
+
+    // Site Detection Manager
+    class SiteDetectionManager {
+        constructor(dependencies = {}) {
+            this.logger = dependencies.logger || EZPrompt.logger;
+            this.errorHandler = dependencies.errorHandler || EZPrompt.errorHandler;
+            this.siteConfigs = this.initializeSiteConfigs();
+            this.customSites = this.loadCustomSites();
+            this.currentSite = null;
+            this.validatedSelectors = new Map();
+        }
+
+        initializeSiteConfigs() {
+            return {
+                'chatgpt': {
+                    name: 'ChatGPT',
+                    domains: ['chat.openai.com', 'chatgpt.com'],
+                    inputSelectors: [
+                        '#prompt-textarea',
+                        'textarea[data-id="root"]',
+                        '.ProseMirror',
+                        'textarea[placeholder*="Message"]',
+                        'div[contenteditable="true"][data-testid="textbox"]'
+                    ],
+                    submitSelectors: [
+                        '[data-testid="send-button"]',
+                        'button[data-testid="send-button"]',
+                        '.btn-primary'
+                    ],
+                    conversationSelectors: [
+                        '[data-testid="conversation-turn"]',
+                        '.conversation-item'
+                    ],
+                    waitForSelectors: true,
+                    dynamicContent: true
+                },
+                'claude': {
+                    name: 'Claude',
+                    domains: ['claude.ai'],
+                    inputSelectors: [
+                        '.ProseMirror',
+                        'div[contenteditable="true"]',
+                        '.composer-input',
+                        '[data-testid="chat-input"]'
+                    ],
+                    submitSelectors: [
+                        'button[aria-label="Send Message"]',
+                        '.send-button'
+                    ],
+                    conversationSelectors: [
+                        '.message',
+                        '[data-testid="message"]'
+                    ],
+                    waitForSelectors: true,
+                    dynamicContent: true
+                },
+                'gemini': {
+                    name: 'Gemini',
+                    domains: ['gemini.google.com'],
+                    inputSelectors: [
+                        '.ql-editor',
+                        'rich-textarea .ql-editor',
+                        '[data-testid="input-area"]',
+                        '.input-area textarea'
+                    ],
+                    submitSelectors: [
+                        'button[aria-label="Send message"]',
+                        '.send-button'
+                    ],
+                    conversationSelectors: [
+                        '.conversation-container .message',
+                        '[data-testid="conversation-turn"]'
+                    ],
+                    waitForSelectors: true,
+                    dynamicContent: true
+                },
+                'deepseek': {
+                    name: 'DeepSeek',
+                    domains: ['chat.deepseek.com'],
+                    inputSelectors: [
+                        '.chat-input textarea',
+                        'textarea[placeholder*="输入"]',
+                        'textarea[placeholder*="Enter"]',
+                        '.input-container textarea'
+                    ],
+                    submitSelectors: [
+                        '.send-btn',
+                        'button[type="submit"]'
+                    ],
+                    conversationSelectors: [
+                        '.message-item',
+                        '.chat-message'
+                    ],
+                    waitForSelectors: true,
+                    dynamicContent: true
+                },
+                'qwen': {
+                    name: 'Qwen',
+                    domains: ['tongyi.aliyun.com', 'qwen.alibaba.com'],
+                    inputSelectors: [
+                        '.chat-input-area textarea',
+                        'textarea[placeholder*="请输入"]',
+                        'textarea[placeholder*="Please enter"]',
+                        '.input-box textarea'
+                    ],
+                    submitSelectors: [
+                        '.send-button',
+                        'button[aria-label*="发送"]',
+                        'button[aria-label*="Send"]'
+                    ],
+                    conversationSelectors: [
+                        '.message-wrapper',
+                        '.chat-item'
+                    ],
+                    waitForSelectors: true,
+                    dynamicContent: true
+                }
+            };
+        }
+
+        loadCustomSites() {
+            try {
+                const customSitesData = GM_getValue('ezprompt_custom_sites', '{}');
+                return EZPrompt.utils.safeJsonParse(customSitesData, {});
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'custom sites');
+                return {};
+            }
+        }
+
+        saveCustomSites() {
+            try {
+                GM_setValue('ezprompt_custom_sites', EZPrompt.utils.safeJsonStringify(this.customSites));
+            } catch (error) {
+                this.errorHandler.handleDataError(error, this.customSites);
+            }
+        }
+
+        detectSite() {
+            const currentDomain = window.location.hostname;
+            this.logger.debug(`Detecting site for domain: ${currentDomain}`);
+
+            // Check predefined sites
+            for (const [siteId, config] of Object.entries(this.siteConfigs)) {
+                if (config.domains.some(domain => currentDomain.includes(domain))) {
+                    this.logger.info(`Detected predefined site: ${config.name}`);
+                    this.currentSite = { id: siteId, ...config };
+                    return this.currentSite;
+                }
+            }
+
+            // Check custom sites
+            for (const [siteId, config] of Object.entries(this.customSites)) {
+                if (config.domains && config.domains.some(domain => currentDomain.includes(domain))) {
+                    this.logger.info(`Detected custom site: ${config.name}`);
+                    this.currentSite = { id: siteId, ...config };
+                    return this.currentSite;
+                }
+            }
+
+            this.logger.debug(`No site configuration found for domain: ${currentDomain}`);
+            return null;
+        }
+
+        async validateSelectors(selectors, timeout = 5000) {
+            if (!Array.isArray(selectors)) {
+                selectors = [selectors];
+            }
+
+            const selectorKey = selectors.join('|');
+
+            // Check cache first with TTL
+            const cached = EZPrompt.cache.selectorValidation.get(selectorKey);
+            if (cached && Date.now() - cached.timestamp < 30000) { // 30 second TTL
+                return cached.result;
+            }
+
+            this.logger.debug(`Validating selectors: ${selectors.join(', ')}`);
+
+            const startTime = Date.now();
+
+            while (Date.now() - startTime < timeout) {
+                for (const selector of selectors) {
+                    try {
+                        const element = EZPrompt.utils.safeQuerySelector(selector);
+                        if (element) {
+                            this.logger.debug(`Valid selector found: ${selector}`);
+                            const result = { selector, element, valid: true };
+
+                            // Cache with TTL
+                            EZPrompt.cache.selectorValidation.set(selectorKey, {
+                                result,
+                                timestamp: Date.now()
+                            });
+
+                            // Store element reference for reuse
+                            EZPrompt.cache.domElements.set(element, {
+                                selector,
+                                lastAccessed: Date.now()
+                            });
+
+                            return result;
+                        }
+                    } catch (error) {
+                        this.errorHandler.handleDOMError(error, selector);
+                    }
+                }
+
+                // Wait a bit before retrying
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+
+            this.logger.warn(`No valid selectors found from: ${selectors.join(', ')}`);
+            const result = { selector: null, element: null, valid: false };
+            this.validatedSelectors.set(selectorKey, result);
+            return result;
+        }
+
+        async findInputElement(siteConfig = null) {
+            const config = siteConfig || this.currentSite;
+            if (!config) {
+                this.logger.warn('No site configuration available for input detection');
+                return null;
+            }
+
+            this.logger.debug(`Finding input element for site: ${config.name}`);
+
+            const validation = await this.validateSelectors(config.inputSelectors);
+            if (validation.valid) {
+                this.logger.info(`Input element found using selector: ${validation.selector}`);
+                return validation.element;
+            }
+
+            // Fallback: try generic input detection
+            const fallbackSelectors = [
+                'textarea[placeholder*="message" i]',
+                'textarea[placeholder*="chat" i]',
+                'textarea[placeholder*="ask" i]',
+                'div[contenteditable="true"]',
+                'textarea:not([readonly]):not([disabled])',
+                'input[type="text"]:not([readonly]):not([disabled])'
+            ];
+
+            this.logger.debug('Trying fallback selectors for input detection');
+            const fallbackValidation = await this.validateSelectors(fallbackSelectors, 2000);
+
+            if (fallbackValidation.valid) {
+                this.logger.info(`Input element found using fallback selector: ${fallbackValidation.selector}`);
+                return fallbackValidation.element;
+            }
+
+            this.logger.warn('No input element found');
+            return null;
+        }
+
+        registerCustomSite(config) {
+            if (!config.id || !config.name || !config.domains || !config.inputSelectors) {
+                throw new Error('Invalid custom site configuration: missing required fields');
+            }
+
+            // Validate domains
+            if (!Array.isArray(config.domains) || config.domains.length === 0) {
+                throw new Error('Custom site must have at least one domain');
+            }
+
+            // Validate selectors
+            if (!Array.isArray(config.inputSelectors) || config.inputSelectors.length === 0) {
+                throw new Error('Custom site must have at least one input selector');
+            }
+
+            this.customSites[config.id] = {
+                name: config.name,
+                domains: config.domains,
+                inputSelectors: config.inputSelectors,
+                submitSelectors: config.submitSelectors || [],
+                conversationSelectors: config.conversationSelectors || [],
+                waitForSelectors: config.waitForSelectors !== false,
+                dynamicContent: config.dynamicContent !== false,
+                created_at: new Date().toISOString()
+            };
+
+            this.saveCustomSites();
+            this.logger.info(`Custom site registered: ${config.name}`);
+        }
+
+        removeCustomSite(siteId) {
+            if (this.customSites[siteId]) {
+                delete this.customSites[siteId];
+                this.saveCustomSites();
+                this.logger.info(`Custom site removed: ${siteId}`);
+                return true;
+            }
+            return false;
+        }
+
+        getAllSites() {
+            const allSites = {};
+
+            // Add predefined sites
+            for (const [id, config] of Object.entries(this.siteConfigs)) {
+                allSites[id] = { ...config, type: 'predefined' };
+            }
+
+            // Add custom sites
+            for (const [id, config] of Object.entries(this.customSites)) {
+                allSites[id] = { ...config, type: 'custom' };
+            }
+
+            return allSites;
+        }
+
+        getCurrentSite() {
+            return this.currentSite;
+        }
+
+        // Monitor for dynamic content changes
+        setupDynamicMonitoring() {
+            if (!this.currentSite || !this.currentSite.dynamicContent) {
+                return;
+            }
+
+            this.logger.debug('Setting up dynamic content monitoring');
+
+            const observer = new MutationObserver(EZPrompt.utils.debounce(() => {
+                this.logger.debug('DOM mutation detected, re-validating selectors');
+                // Clear validation cache to force re-validation
+                this.validatedSelectors.clear();
+            }, 500));
+
+            observer.observe(document.body, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['class', 'id']
+            });
+
+            // Store observer for cleanup
+            this.mutationObserver = observer;
+        }
+
+        cleanup() {
+            if (this.mutationObserver) {
+                this.mutationObserver.disconnect();
+                this.mutationObserver = null;
+            }
+            this.validatedSelectors.clear();
+        }
+
+        async initialize() {
+            this.logger.info('Initializing SiteDetectionManager');
+
+            // Detect current site
+            this.detectSite();
+
+            if (this.currentSite) {
+                // Setup dynamic monitoring if needed
+                this.setupDynamicMonitoring();
+
+                // Pre-validate input selectors
+                await this.findInputElement();
+            }
+
+            this.logger.info('SiteDetectionManager initialized');
+        }
+    }
+
+    // Utility functions
+    const Utils = {
+        // Safe DOM ready check
+        domReady(callback) {
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', callback);
+            } else {
+                callback();
+            }
+        },
+
+        // Safe element selection with error handling
+        safeQuerySelector(selector, context = document) {
+            try {
+                return context.querySelector(selector);
+            } catch (error) {
+                EZPrompt.errorHandler.handleDOMError(error, selector);
+                return null;
+            }
+        },
+
+        // Safe element selection (multiple) with error handling
+        safeQuerySelectorAll(selector, context = document) {
+            try {
+                return Array.from(context.querySelectorAll(selector));
+            } catch (error) {
+                EZPrompt.errorHandler.handleDOMError(error, selector);
+                return [];
+            }
+        },
+
+        // Debounce function for performance
+        debounce(func, wait) {
+            let timeout;
+            return function executedFunction(...args) {
+                const later = () => {
+                    clearTimeout(timeout);
+                    func(...args);
+                };
+                clearTimeout(timeout);
+                timeout = setTimeout(later, wait);
+            };
+        },
+
+        // Throttle function for performance
+        throttle(func, limit) {
+            let inThrottle;
+            return function (...args) {
+                if (!inThrottle) {
+                    func.apply(this, args);
+                    inThrottle = true;
+                    setTimeout(() => inThrottle = false, limit);
+                }
+            };
+        },
+
+        // Generate unique ID
+        generateId() {
+            return 'ezp_' + Math.random().toString(36).substring(2, 11) + '_' + Date.now();
+        },
+
+        // Safe JSON parse
+        safeJsonParse(str, defaultValue = null) {
+            try {
+                return JSON.parse(str);
+            } catch (error) {
+                EZPrompt.errorHandler.handleDataError(error, str);
+                return defaultValue;
+            }
+        },
+
+        // Safe JSON stringify
+        safeJsonStringify(obj, defaultValue = '{}') {
+            try {
+                return JSON.stringify(obj);
+            } catch (error) {
+                EZPrompt.errorHandler.handleDataError(error, obj);
+                return defaultValue;
+            }
+        }
+    };
+
+    // Initialize core components with enhanced debugging
+    function initializeCore() {
+        try {
+            // Initialize logger with enhanced capabilities
+            EZPrompt.logger = new Logger('EZPrompt');
+            EZPrompt.logger.info(`EZPrompt v${EZPrompt.version} initializing...`);
+
+            // Initialize error handler
+            EZPrompt.errorHandler = new ErrorHandler(EZPrompt.logger);
+
+            // Initialize module registry
+            EZPrompt.moduleRegistry = new ModuleRegistry(EZPrompt.logger);
+
+            // Add utilities to namespace
+            EZPrompt.utils = Utils;
+
+            // Initialize debug and reporting system
+            EZPrompt.debugSystem = new DebugSystem(EZPrompt.logger, EZPrompt.errorHandler);
+
+            // Initialize memory manager AFTER logger is ready (fix for early undefined logger errors)
+            if (!EZPrompt.memoryManager) {
+                EZPrompt.memoryManager = new MemoryManager(EZPrompt.logger);
+            }
+
+            // Set up debug menu commands if available
+            if (typeof GM_registerMenuCommand !== 'undefined') {
+                setupDebugMenuCommands();
+            }
+
+            EZPrompt.logger.info('Core components initialized successfully');
+            return true;
+        } catch (error) {
+            console.error('Failed to initialize EZPrompt core:', error);
+            return false;
+        }
+    }
+
+    // Debug and reporting system
+    class DebugSystem {
+        constructor(logger, errorHandler) {
+            this.logger = logger;
+            this.errorHandler = errorHandler;
+            this.debugData = {
+                startTime: Date.now(),
+                operations: [],
+                performance: {},
+                userActions: []
+            };
+            this.maxOperations = 1000;
+        }
+
+        // Log operation with timing
+        logOperation(operation, details = {}) {
+            const operationData = {
+                id: EZPrompt.utils.generateId(),
+                operation,
+                details,
+                timestamp: Date.now(),
+                duration: null,
+                success: null,
+                error: null
+            };
+
+            this.debugData.operations.push(operationData);
+
+            // Keep only recent operations
+            if (this.debugData.operations.length > this.maxOperations) {
+                this.debugData.operations.splice(0, this.debugData.operations.length - this.maxOperations);
+            }
+
+            return operationData;
+        }
+
+        // Complete operation logging
+        completeOperation(operationData, success = true, error = null) {
+            operationData.duration = Date.now() - operationData.timestamp;
+            operationData.success = success;
+            operationData.error = error;
+
+            if (operationData.duration > 1000) {
+                this.logger.warn(`Slow operation detected: ${operationData.operation} took ${operationData.duration}ms`);
+            }
+        }
+
+        // Log user action
+        logUserAction(action, details = {}) {
+            this.debugData.userActions.push({
+                action,
+                details,
+                timestamp: Date.now()
+            });
+
+            // Keep only recent actions
+            if (this.debugData.userActions.length > 100) {
+                this.debugData.userActions.splice(0, this.debugData.userActions.length - 100);
+            }
+        }
+
+        // Record performance metric
+        recordPerformance(metric, value) {
+            if (!this.debugData.performance[metric]) {
+                this.debugData.performance[metric] = [];
+            }
+
+            this.debugData.performance[metric].push({
+                value,
+                timestamp: Date.now()
+            });
+
+            // Keep only recent metrics
+            if (this.debugData.performance[metric].length > 100) {
+                this.debugData.performance[metric].splice(0, this.debugData.performance[metric].length - 100);
+            }
+        }
+
+        // Generate comprehensive debug report
+        generateDebugReport() {
+            const report = {
+                metadata: {
+                    version: EZPrompt.version,
+                    generated: new Date().toISOString(),
+                    uptime: Date.now() - this.debugData.startTime,
+                    url: window.location.href,
+                    userAgent: navigator.userAgent
+                },
+                system: {
+                    initialized: EZPrompt.initialized,
+                    degradedMode: EZPrompt.degradedMode || false,
+                    lastHealthCheck: EZPrompt.lastHealthCheck || null,
+                    modules: {}
+                },
+                errors: this.errorHandler.getErrorReport(),
+                operations: this.getOperationSummary(),
+                performance: this.getPerformanceSummary(),
+                userActions: this.debugData.userActions.slice(-20), // Last 20 actions
+                storage: this.getStorageInfo(),
+                configuration: this.getConfigurationInfo()
+            };
+
+            // Add module status
+            for (const [name, module] of Object.entries(EZPrompt.modules || {})) {
+                report.system.modules[name] = {
+                    loaded: !!module,
+                    type: module?.constructor?.name || 'unknown'
+                };
+            }
+
+            return report;
+        }
+
+        getOperationSummary() {
+            const recent = this.debugData.operations.slice(-50); // Last 50 operations
+            const summary = {
+                total: this.debugData.operations.length,
+                recent: recent.length,
+                byType: {},
+                averageDuration: 0,
+                slowOperations: []
+            };
+
+            let totalDuration = 0;
+            let completedOperations = 0;
+
+            recent.forEach(op => {
+                // Count by type
+                summary.byType[op.operation] = (summary.byType[op.operation] || 0) + 1;
+
+                // Calculate average duration
+                if (op.duration !== null) {
+                    totalDuration += op.duration;
+                    completedOperations++;
+
+                    // Track slow operations
+                    if (op.duration > 1000) {
+                        summary.slowOperations.push({
+                            operation: op.operation,
+                            duration: op.duration,
+                            timestamp: op.timestamp
+                        });
+                    }
+                }
+            });
+
+            if (completedOperations > 0) {
+                summary.averageDuration = Math.round(totalDuration / completedOperations);
+            }
+
+            return summary;
+        }
+
+        getPerformanceSummary() {
+            const summary = {};
+
+            for (const [metric, values] of Object.entries(this.debugData.performance)) {
+                const recentValues = values.slice(-20).map(v => v.value);
+                summary[metric] = {
+                    count: values.length,
+                    recent: recentValues.length,
+                    average: recentValues.reduce((a, b) => a + b, 0) / recentValues.length || 0,
+                    min: Math.min(...recentValues) || 0,
+                    max: Math.max(...recentValues) || 0
+                };
+            }
+
+            return summary;
+        }
+
+        getStorageInfo() {
+            try {
+                if (!EZPrompt.modules.storage) {
+                    return { available: false };
+                }
+
+                const prompts = EZPrompt.modules.storage.getAllPrompts() || {};
+                const categories = EZPrompt.modules.storage.getAllCategories() || {};
+                const config = EZPrompt.modules.storage.getUserConfig() || {};
+
+                return {
+                    available: true,
+                    promptCount: Object.keys(prompts).length,
+                    categoryCount: Object.keys(categories).length,
+                    hasConfig: Object.keys(config).length > 0,
+                    configKeys: Object.keys(config)
+                };
+            } catch (error) {
+                return {
+                    available: false,
+                    error: error.message
+                };
+            }
+        }
+
+        getConfigurationInfo() {
+            try {
+                const config = EZPrompt.modules.storage?.getUserConfig() || {};
+                return {
+                    theme: config.ui_theme || 'auto',
+                    language: config.language || 'en',
+                    insertionMode: config.insertion_mode || 'replace',
+                    autoSync: config.auto_sync || false,
+                    hasWebDAV: !!config.webdav_config
+                };
+            } catch (error) {
+                return {
+                    error: error.message
+                };
+            }
+        }
+
+        // Export debug data
+        exportDebugData() {
+            try {
+                const report = this.generateDebugReport();
+                const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `ezprompt-debug-${new Date().toISOString().split('T')[0]}.json`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+
+                this.logger.info('Debug data exported successfully');
+                return true;
+            } catch (error) {
+                this.logger.error('Failed to export debug data:', error);
+                return false;
+            }
+        }
+
+        // Clear debug data
+        clearDebugData() {
+            this.debugData.operations = [];
+            this.debugData.userActions = [];
+            this.debugData.performance = {};
+            this.errorHandler.clearErrorHistory();
+            this.logger.info('Debug data cleared');
+        }
+    }
+
+    // Set up debug menu commands
+    function setupDebugMenuCommands() {
+        try {
+            GM_registerMenuCommand('EZPrompt - Debug Report', () => {
+                if (EZPrompt.debugSystem) {
+                    const report = EZPrompt.debugSystem.generateDebugReport();
+                    console.log('EZPrompt Debug Report:', report);
+                    alert('Debug report generated. Check browser console for details.');
+                } else {
+                    alert('Debug system not available');
+                }
+            });
+
+            GM_registerMenuCommand('EZPrompt - Export Debug Data', () => {
+                if (EZPrompt.debugSystem) {
+                    const success = EZPrompt.debugSystem.exportDebugData();
+                    if (!success) {
+                        alert('Failed to export debug data. Check console for details.');
+                    }
+                } else {
+                    alert('Debug system not available');
+                }
+            });
+
+            GM_registerMenuCommand('EZPrompt - Clear Debug Data', () => {
+                if (confirm('Clear all debug data? This cannot be undone.')) {
+                    if (EZPrompt.debugSystem) {
+                        EZPrompt.debugSystem.clearDebugData();
+                        alert('Debug data cleared');
+                    } else {
+                        alert('Debug system not available');
+                    }
+                }
+            });
+
+            GM_registerMenuCommand('EZPrompt - System Status', () => {
+                const status = {
+                    version: EZPrompt.version,
+                    initialized: EZPrompt.initialized,
+                    degradedMode: EZPrompt.degradedMode || false,
+                    modules: Object.keys(EZPrompt.modules || {}),
+                    lastHealthCheck: EZPrompt.lastHealthCheck
+                };
+                console.log('EZPrompt System Status:', status);
+                alert(`EZPrompt Status:\nVersion: ${status.version}\nInitialized: ${status.initialized}\nModules: ${status.modules.join(', ')}`);
+            });
+
+        } catch (error) {
+            console.warn('Failed to set up debug menu commands:', error);
+        }
+    }
+
+    // Enhanced initialization function with comprehensive error handling
+    async function initialize() {
+        if (EZPrompt.initialized) {
+            EZPrompt.logger.debug('EZPrompt already initialized');
+            return;
+        }
+
+        const initializationSteps = [
+            { name: 'Core Components', fn: initializeCore },
+            { name: 'DOM Ready', fn: waitForDOM },
+            { name: 'Module Registration', fn: registerModules },
+            { name: 'Module Initialization', fn: initializeModules },
+            { name: 'Post-Initialization', fn: postInitialization }
+        ];
+
+        let completedSteps = 0;
+        const totalSteps = initializationSteps.length;
+
+        try {
+            EZPrompt.logger.info(`Starting EZPrompt initialization (${totalSteps} steps)...`);
+
+            for (const step of initializationSteps) {
+                try {
+                    EZPrompt.logger.debug(`Step ${completedSteps + 1}/${totalSteps}: ${step.name}`);
+                    await step.fn();
+                    completedSteps++;
+                    EZPrompt.logger.debug(`✓ ${step.name} completed`);
+                } catch (error) {
+                    const isRecoverable = await handleInitializationError(error, step.name, completedSteps, totalSteps);
+                    if (!isRecoverable) {
+                        throw error;
+                    }
+                    completedSteps++;
+                }
+            }
+
+            EZPrompt.initialized = true;
+            EZPrompt.logger.info('EZPrompt initialization complete');
+
+            // Set up error handler notification system
+            if (EZPrompt.modules.uiManager) {
+                EZPrompt.errorHandler.setNotificationSystem(EZPrompt.modules.uiManager);
+            }
+
+            // Show initialization success (only in debug mode)
+            if (EZPrompt.debug && EZPrompt.modules.uiManager) {
+                EZPrompt.modules.uiManager.showNotification(
+                    'EZPrompt initialized successfully',
+                    'success',
+                    { duration: 2000 }
+                );
+            }
+
+        } catch (error) {
+            await handleCriticalInitializationFailure(error, completedSteps, totalSteps);
+        }
+    }
+
+    // Individual initialization steps
+    async function waitForDOM() {
+        return new Promise(resolve => {
+            EZPrompt.utils.domReady(resolve);
+        });
+    }
+
+    async function registerModules() {
+        // Register core modules with error handling
+        const moduleRegistrations = [
+            { name: 'siteDetection', class: SiteDetectionManager, deps: [] },
+            { name: 'storage', class: StorageManager, deps: [] },
+            { name: 'templateEngine', class: TemplateEngine, deps: ['storage'] },
+            { name: 'promptEngine', class: PromptEngine, deps: ['storage', 'templateEngine'] },
+            { name: 'uiManager', class: UIManager, deps: ['siteDetection', 'storage'] },
+            { name: 'inputHandler', class: InputHandler, deps: ['siteDetection', 'storage', 'uiManager'] },
+            { name: 'syncManager', class: SyncManager, deps: ['storage'] }
+        ];
+
+        for (const module of moduleRegistrations) {
+            try {
+                EZPrompt.moduleRegistry.register(module.name, module.class, module.deps);
+            } catch (error) {
+                EZPrompt.logger.error(`Failed to register module ${module.name}:`, error);
+                throw new Error(`Module registration failed: ${module.name}`);
+            }
+        }
+    }
+
+    async function initializeModules() {
+        const modules = await EZPrompt.moduleRegistry.initializeAll();
+        EZPrompt.modules = modules;
+
+        // Check for critical module failures
+        const criticalModules = ['siteDetection', 'storage'];
+        const failedCritical = criticalModules.filter(name => !modules[name]);
+
+        if (failedCritical.length > 0) {
+            throw new Error(`Critical modules failed to initialize: ${failedCritical.join(', ')}`);
+        }
+
+        // Log non-critical module failures
+        const allModules = ['siteDetection', 'storage', 'templateEngine', 'promptEngine', 'uiManager', 'inputHandler', 'syncManager'];
+        const failedNonCritical = allModules.filter(name => !criticalModules.includes(name) && !modules[name]);
+
+        if (failedNonCritical.length > 0) {
+            EZPrompt.logger.warn(`Non-critical modules failed to initialize: ${failedNonCritical.join(', ')}`);
+        }
+    }
+
+    async function postInitialization() {
+        // Set up global error handling integration
+        if (EZPrompt.modules.uiManager) {
+            EZPrompt.errorHandler.setNotificationSystem(EZPrompt.modules.uiManager);
+        }
+
+        // Check for site compatibility
+        if (EZPrompt.modules.siteDetection) {
+            const site = EZPrompt.modules.siteDetection.detectSite();
+            if (!site) {
+                EZPrompt.logger.warn('Current site not supported - EZPrompt will have limited functionality');
+            }
+        }
+
+        // Test storage functionality
+        if (EZPrompt.modules.storage) {
+            try {
+                EZPrompt.modules.storage.getUserConfig();
+            } catch (error) {
+                EZPrompt.logger.warn('Storage test failed - some features may not work properly');
+            }
+        }
+
+        // Set up periodic health checks
+        setupHealthChecks();
+    }
+
+    // Handle initialization errors with recovery strategies
+    async function handleInitializationError(error, stepName, completedSteps, totalSteps) {
+        EZPrompt.logger.error(`Initialization step '${stepName}' failed:`, error);
+
+        const recoveryStrategies = {
+            'Core Components': () => {
+                // Core components failure is not recoverable
+                return false;
+            },
+            'DOM Ready': () => {
+                // DOM ready failure is not recoverable
+                return false;
+            },
+            'Module Registration': () => {
+                // Try to continue with partial registration
+                EZPrompt.logger.warn('Continuing with partial module registration');
+                return true;
+            },
+            'Module Initialization': () => {
+                // Continue with available modules
+                EZPrompt.logger.warn('Continuing with available modules');
+                return true;
+            },
+            'Post-Initialization': () => {
+                // Post-init failures are recoverable
+                EZPrompt.logger.warn('Post-initialization failed, but core functionality available');
+                return true;
+            }
+        };
+
+        const strategy = recoveryStrategies[stepName];
+        if (strategy) {
+            return strategy();
+        }
+
+        return false; // Default to non-recoverable
+    }
+
+    // Handle critical initialization failures
+    async function handleCriticalInitializationFailure(error, completedSteps, totalSteps) {
+        const errorInfo = EZPrompt.errorHandler?.handleError(error, 'Critical Initialization Failure', {
+            completedSteps,
+            totalSteps,
+            severity: 'critical'
+        }) || { message: error.message };
+
+        // Try to show error to user if possible
+        try {
+            if (typeof GM_notification !== 'undefined') {
+                GM_notification(
+                    `EZPrompt initialization failed: ${errorInfo.message}`,
+                    'EZPrompt Error',
+                    null,
+                    () => { }
+                );
+            }
+        } catch (notificationError) {
+            // Fallback to console
+            console.error('EZPrompt initialization failed:', error);
+        }
+
+        // Set up minimal error reporting
+        EZPrompt.initialized = false;
+        EZPrompt.initializationError = errorInfo;
+
+        // Try to enable degraded mode if possible
+        try {
+            await enableDegradedMode();
+        } catch (degradedError) {
+            EZPrompt.logger?.error('Failed to enable degraded mode:', degradedError);
+        }
+    }
+
+    // Enable degraded mode with minimal functionality
+    async function enableDegradedMode() {
+        EZPrompt.logger?.warn('Enabling degraded mode with minimal functionality');
+
+        // Try to provide basic error reporting
+        if (typeof GM_registerMenuCommand !== 'undefined') {
+            GM_registerMenuCommand('EZPrompt - View Errors', () => {
+                const errors = EZPrompt.errorHandler?.getErrorReport() || 'No error information available';
+                alert(`EZPrompt Error Report:\n${JSON.stringify(errors, null, 2)}`);
+            });
+        }
+
+        EZPrompt.degradedMode = true;
+    }
+
+    // Set up periodic health checks
+    function setupHealthChecks() {
+        // Check system health every 5 minutes
+        setInterval(() => {
+            try {
+                performHealthCheck();
+            } catch (error) {
+                EZPrompt.errorHandler?.handleError(error, 'Health Check');
+            }
+        }, 5 * 60 * 1000);
+    }
+
+    // Perform system health check
+    function performHealthCheck() {
+        const healthStatus = {
+            timestamp: new Date().toISOString(),
+            modules: {},
+            storage: false,
+            network: false,
+            errors: 0
+        };
+
+        // Check module health
+        for (const [name, module] of Object.entries(EZPrompt.modules || {})) {
+            healthStatus.modules[name] = !!module;
+        }
+
+        // Check storage health
+        try {
+            if (EZPrompt.modules.storage) {
+                EZPrompt.modules.storage.getUserConfig();
+                healthStatus.storage = true;
+            }
+        } catch (error) {
+            EZPrompt.logger.warn('Storage health check failed:', error);
+        }
+
+        // Check recent error count
+        try {
+            const recentErrors = EZPrompt.errorHandler?.getRecentErrors(5 * 60 * 1000) || [];
+            healthStatus.errors = recentErrors.length;
+
+            // Alert if too many errors
+            if (healthStatus.errors > 10) {
+                EZPrompt.logger.warn(`High error rate detected: ${healthStatus.errors} errors in last 5 minutes`);
+            }
+        } catch (error) {
+            EZPrompt.logger.warn('Error count check failed:', error);
+        }
+
+        EZPrompt.lastHealthCheck = healthStatus;
+        EZPrompt.logger.debug('Health check completed:', healthStatus);
+    }
+
+    // Data Models and Interfaces
+    const DataModels = {
+        // Prompt interface validation
+        validatePrompt(prompt) {
+            const required = ['id', 'name', 'content', 'category'];
+            const missing = required.filter(field => !prompt.hasOwnProperty(field));
+
+            if (missing.length > 0) {
+                throw new Error(`Missing required fields: ${missing.join(', ')}`);
+            }
+
+            if (typeof prompt.id !== 'string' || prompt.id.trim() === '') {
+                throw new Error('Prompt ID must be a non-empty string');
+            }
+
+            if (typeof prompt.name !== 'string' || prompt.name.trim() === '') {
+                throw new Error('Prompt name must be a non-empty string');
+            }
+
+            if (typeof prompt.content !== 'string' || prompt.content.trim() === '') {
+                throw new Error('Prompt content must be a non-empty string');
+            }
+
+            if (typeof prompt.category !== 'string') {
+                throw new Error('Prompt category must be a string');
+            }
+
+            return true;
+        },
+
+        // Category interface validation
+        validateCategory(category) {
+            const required = ['id', 'name'];
+            const missing = required.filter(field => !category.hasOwnProperty(field));
+
+            if (missing.length > 0) {
+                throw new Error(`Missing required fields: ${missing.join(', ')}`);
+            }
+
+            if (typeof category.id !== 'string' || category.id.trim() === '') {
+                throw new Error('Category ID must be a non-empty string');
+            }
+
+            if (typeof category.name !== 'string' || category.name.trim() === '') {
+                throw new Error('Category name must be a non-empty string');
+            }
+
+            if (category.parent_id && typeof category.parent_id !== 'string') {
+                throw new Error('Category parent_id must be a string');
+            }
+
+            return true;
+        },
+
+        // UserConfig interface validation
+        validateUserConfig(config) {
+            if (typeof config !== 'object' || config === null) {
+                throw new Error('UserConfig must be an object');
+            }
+
+            const validInsertionModes = ['replace', 'prefix', 'suffix'];
+            if (config.insertion_mode && !validInsertionModes.includes(config.insertion_mode)) {
+                throw new Error(`Invalid insertion_mode. Must be one of: ${validInsertionModes.join(', ')}`);
+            }
+
+            const validThemes = ['light', 'dark', 'auto'];
+            if (config.ui_theme && !validThemes.includes(config.ui_theme)) {
+                throw new Error(`Invalid ui_theme. Must be one of: ${validThemes.join(', ')}`);
+            }
+
+            const validLanguages = ['en', 'zh'];
+            if (config.language && !validLanguages.includes(config.language)) {
+                throw new Error(`Invalid language. Must be one of: ${validLanguages.join(', ')}`);
+            }
+
+            return true;
+        },
+
+        // Create default prompt object
+        createPrompt(data) {
+            // Validate required fields before creating defaults
+            const required = ['name', 'content'];
+            const missing = required.filter(field => !data.hasOwnProperty(field) || !data[field]);
+
+            if (missing.length > 0) {
+                throw new Error(`Missing required fields: ${missing.join(', ')}`);
+            }
+
+            const now = new Date().toISOString();
+            const prompt = {
+                id: data.id || EZPrompt.utils.generateId(),
+                name: data.name,
+                content: data.content,
+                category: data.category || 'default',
+                tags: Array.isArray(data.tags) ? data.tags : [],
+                variables: Array.isArray(data.variables) ? data.variables : [],
+                usage_count: typeof data.usage_count === 'number' ? data.usage_count : 0,
+                created_at: data.created_at || now,
+                updated_at: data.updated_at || now
+            };
+
+            this.validatePrompt(prompt);
+            return prompt;
+        },
+
+        // Create default category object
+        createCategory(data) {
+            // Validate required fields before creating defaults
+            const required = ['name'];
+            const missing = required.filter(field => !data.hasOwnProperty(field) || !data[field]);
+
+            if (missing.length > 0) {
+                throw new Error(`Missing required fields: ${missing.join(', ')}`);
+            }
+
+            const now = new Date().toISOString();
+            const category = {
+                id: data.id || EZPrompt.utils.generateId(),
+                name: data.name,
+                color: data.color || null,
+                parent_id: data.parent_id || null,
+                created_at: data.created_at || now,
+                updated_at: data.updated_at || now
+            };
+
+            this.validateCategory(category);
+            return category;
+        },
+
+        // Create default user config object
+        createUserConfig(data = {}) {
+            const config = {
+                shortcuts: data.shortcuts || {
+                    'open_panel': 'Ctrl+Shift+P',
+                    'open_settings': 'Ctrl+Shift+S',
+                    'mode_replace': 'Ctrl+Shift+R',
+                    'mode_prefix': 'Ctrl+Shift+1',
+                    'mode_suffix': 'Ctrl+Shift+2'
+                },
+                insertion_mode: data.insertion_mode || 'replace',
+                auto_sync: typeof data.auto_sync === 'boolean' ? data.auto_sync : false,
+                webdav_config: data.webdav_config || null,
+                ui_theme: data.ui_theme || 'auto',
+                language: data.language || 'en',
+                created_at: data.created_at || new Date().toISOString(),
+                updated_at: data.updated_at || new Date().toISOString()
+            };
+
+            this.validateUserConfig(config);
+            return config;
+        }
+    };
+
+    // Prompt Engine Class
+    class PromptEngine {
+        constructor(dependencies = {}) {
+            this.logger = dependencies.logger || EZPrompt.logger;
+            this.errorHandler = dependencies.errorHandler || EZPrompt.errorHandler;
+            this.storage = dependencies.storage;
+            this.templateEngine = dependencies.templateEngine;
+
+            // Search configuration
+            this.searchConfig = {
+                fuzzyThreshold: 0.6, // Minimum similarity score for fuzzy matching
+                maxResults: 50,      // Maximum number of search results
+                cacheSize: 100,      // Number of cached search results
+                debounceDelay: 150   // Debounce delay for search operations
+            };
+
+            // Search cache for performance
+            this.searchCache = new Map();
+            this.lastSearchQuery = '';
+            this.lastSearchResults = [];
+
+            // Debounced search function
+            this.debouncedSearch = EZPrompt.utils.debounce(
+                this._performSearch.bind(this),
+                this.searchConfig.debounceDelay
+            );
+        }
+
+        // Main search interface with caching and debouncing
+        searchPrompts(query, options = {}) {
+            if (!query || typeof query !== 'string') {
+                return this.getAllPrompts(options);
+            }
+
+            const normalizedQuery = query.toLowerCase().trim();
+
+            // Check cache first
+            const cacheKey = this._generateCacheKey(normalizedQuery, options);
+            if (this.searchCache.has(cacheKey)) {
+                this.logger.debug(`Search cache hit for query: ${normalizedQuery}`);
+                return this.searchCache.get(cacheKey);
+            }
+
+            // Perform search
+            const results = this._performSearch(normalizedQuery, options);
+
+            // Cache results
+            this._cacheResults(cacheKey, results);
+
+            return results;
+        }
+
+        // Core search implementation
+        _performSearch(query, options = {}) {
+            try {
+                const {
+                    category = null,
+                    tags = [],
+                    sortBy = 'relevance', // 'relevance', 'name', 'usage', 'date'
+                    sortOrder = 'desc',   // 'asc', 'desc'
+                    limit = this.searchConfig.maxResults
+                } = options;
+
+                this.logger.debug(`Performing search for: "${query}" with options:`, options);
+
+                // Get all prompts
+                const allPrompts = this.storage ? this.storage.getAllPrompts() : {};
+                let prompts = Object.values(allPrompts);
+
+                // Apply category filter
+                if (category) {
+                    prompts = prompts.filter(prompt => prompt.category === category);
+                }
+
+                // Apply tags filter
+                if (tags.length > 0) {
+                    prompts = prompts.filter(prompt =>
+                        tags.some(tag => prompt.tags && prompt.tags.includes(tag))
+                    );
+                }
+
+                // Perform fuzzy search and scoring
+                const scoredPrompts = prompts.map(prompt => {
+                    const score = this._calculateRelevanceScore(prompt, query);
+                    return { ...prompt, _searchScore: score };
+                }).filter(prompt => prompt._searchScore >= this.searchConfig.fuzzyThreshold);
+
+                // Sort results
+                const sortedPrompts = this._sortPrompts(scoredPrompts, sortBy, sortOrder);
+
+                // Apply limit
+                const limitedPrompts = sortedPrompts.slice(0, limit);
+
+                // Remove search score from final results
+                const finalResults = limitedPrompts.map(prompt => {
+                    const { _searchScore, ...cleanPrompt } = prompt;
+                    return cleanPrompt;
+                });
+
+                this.logger.debug(`Search completed: ${finalResults.length} results found`);
+                return finalResults;
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Prompt search');
+                return [];
+            }
+        }
+
+        // Calculate relevance score using fuzzy matching
+        _calculateRelevanceScore(prompt, query) {
+            const weights = {
+                name: 0.4,      // Name matches are most important
+                content: 0.3,   // Content matches are important
+                tags: 0.2,      // Tag matches are moderately important
+                category: 0.1   // Category matches are least important
+            };
+
+            let totalScore = 0;
+
+            // Score name match
+            const nameScore = this._fuzzyMatch(prompt.name.toLowerCase(), query);
+            totalScore += nameScore * weights.name;
+
+            // Score content match
+            const contentScore = this._fuzzyMatch(prompt.content.toLowerCase(), query);
+            totalScore += contentScore * weights.content;
+
+            // Score tags match
+            if (prompt.tags && prompt.tags.length > 0) {
+                const tagsText = prompt.tags.join(' ').toLowerCase();
+                const tagsScore = this._fuzzyMatch(tagsText, query);
+                totalScore += tagsScore * weights.tags;
+            }
+
+            // Score category match
+            const categoryScore = this._fuzzyMatch(prompt.category.toLowerCase(), query);
+            totalScore += categoryScore * weights.category;
+
+            // Boost score for exact matches
+            if (prompt.name.toLowerCase().includes(query)) {
+                totalScore += 0.2;
+            }
+
+            // Boost score for usage frequency
+            const usageBoost = Math.min(prompt.usage_count / 100, 0.1);
+            totalScore += usageBoost;
+
+            return Math.min(totalScore, 1.0); // Cap at 1.0
+        }
+
+        // Fuzzy matching algorithm using Levenshtein distance
+        _fuzzyMatch(text, query) {
+            if (!text || !query) return 0;
+
+            // Exact match gets highest score
+            if (text === query) return 1.0;
+
+            // Substring match gets high score
+            if (text.includes(query)) {
+                return 0.8 + (query.length / text.length) * 0.2;
+            }
+
+            // Calculate similarity using Levenshtein distance
+            const distance = this._levenshteinDistance(text, query);
+            const maxLength = Math.max(text.length, query.length);
+
+            if (maxLength === 0) return 1.0;
+
+            const similarity = 1 - (distance / maxLength);
+
+            // Apply threshold for fuzzy matching
+            return similarity > 0.3 ? similarity : 0;
+        }
+
+        // Levenshtein distance calculation for fuzzy matching
+        _levenshteinDistance(str1, str2) {
+            const matrix = [];
+
+            // Initialize matrix
+            for (let i = 0; i <= str2.length; i++) {
+                matrix[i] = [i];
+            }
+
+            for (let j = 0; j <= str1.length; j++) {
+                matrix[0][j] = j;
+            }
+
+            // Fill matrix
+            for (let i = 1; i <= str2.length; i++) {
+                for (let j = 1; j <= str1.length; j++) {
+                    if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
+                        matrix[i][j] = matrix[i - 1][j - 1];
+                    } else {
+                        matrix[i][j] = Math.min(
+                            matrix[i - 1][j - 1] + 1, // substitution
+                            matrix[i][j - 1] + 1,     // insertion
+                            matrix[i - 1][j] + 1      // deletion
+                        );
+                    }
+                }
+            }
+
+            return matrix[str2.length][str1.length];
+        }
+
+        // Sort prompts based on criteria
+        _sortPrompts(prompts, sortBy, sortOrder) {
+            const sortFunctions = {
+                relevance: (a, b) => b._searchScore - a._searchScore,
+                name: (a, b) => a.name.localeCompare(b.name),
+                usage: (a, b) => b.usage_count - a.usage_count,
+                date: (a, b) => new Date(b.updated_at) - new Date(a.updated_at)
+            };
+
+            const sortFn = sortFunctions[sortBy] || sortFunctions.relevance;
+            const sorted = [...prompts].sort(sortFn);
+
+            return sortOrder === 'asc' ? sorted.reverse() : sorted;
+        }
+
+        // Generate cache key for search results
+        _generateCacheKey(query, options) {
+            const optionsStr = JSON.stringify(options);
+            return `${query}|${optionsStr}`;
+        }
+
+        // Cache search results with size limit
+        _cacheResults(key, results) {
+            // Remove oldest entries if cache is full
+            if (this.searchCache.size >= this.searchConfig.cacheSize) {
+                const firstKey = this.searchCache.keys().next().value;
+                this.searchCache.delete(firstKey);
+            }
+
+            this.searchCache.set(key, results);
+        }
+
+        // Clear search cache
+        clearSearchCache() {
+            this.searchCache.clear();
+            this.logger.debug('Search cache cleared');
+        }
+
+        // Get prompts by category with optional sorting
+        getPromptsByCategory(category, options = {}) {
+            try {
+                const {
+                    sortBy = 'name',
+                    sortOrder = 'asc',
+                    limit = null
+                } = options;
+
+                const allPrompts = this.storage ? this.storage.getAllPrompts() : {};
+                let prompts = Object.values(allPrompts).filter(prompt => prompt.category === category);
+
+                // Sort prompts
+                prompts = this._sortPrompts(prompts, sortBy, sortOrder);
+
+                // Apply limit if specified
+                if (limit && limit > 0) {
+                    prompts = prompts.slice(0, limit);
+                }
+
+                this.logger.debug(`Retrieved ${prompts.length} prompts for category: ${category}`);
+                return prompts;
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Get prompts by category');
+                return [];
+            }
+        }
+
+        // Get all prompts with optional filtering and sorting
+        getAllPrompts(options = {}) {
+            try {
+                const {
+                    category = null,
+                    tags = [],
+                    sortBy = 'name',
+                    sortOrder = 'asc',
+                    limit = null
+                } = options;
+
+                const allPrompts = this.storage ? this.storage.getAllPrompts() : {};
+                let prompts = Object.values(allPrompts);
+
+                // Apply category filter
+                if (category) {
+                    prompts = prompts.filter(prompt => prompt.category === category);
+                }
+
+                // Apply tags filter
+                if (tags.length > 0) {
+                    prompts = prompts.filter(prompt =>
+                        tags.some(tag => prompt.tags && prompt.tags.includes(tag))
+                    );
+                }
+
+                // Sort prompts
+                prompts = this._sortPrompts(prompts, sortBy, sortOrder);
+
+                // Apply limit if specified
+                if (limit && limit > 0) {
+                    prompts = prompts.slice(0, limit);
+                }
+
+                this.logger.debug(`Retrieved ${prompts.length} prompts`);
+                return prompts;
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Get all prompts');
+                return [];
+            }
+        }
+
+        // Prompt CRUD operations with validation
+        createPrompt(promptData) {
+            try {
+                if (!this.storage) {
+                    throw new Error('Storage manager not available');
+                }
+
+                // Validate and create prompt using DataModels
+                const prompt = DataModels.createPrompt(promptData);
+
+                // Save to storage
+                const savedPrompt = this.storage.savePrompt(prompt);
+
+                // Clear search cache since data changed
+                this.clearSearchCache();
+
+                this.logger.info(`Prompt created: ${savedPrompt.id}`);
+                return savedPrompt;
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Create prompt');
+                throw new Error('Failed to create prompt: ' + error.message);
+            }
+        }
+
+        updatePrompt(id, updates) {
+            try {
+                if (!this.storage) {
+                    throw new Error('Storage manager not available');
+                }
+
+                // Update prompt in storage
+                const updatedPrompt = this.storage.updatePrompt(id, updates);
+
+                // Clear search cache since data changed
+                this.clearSearchCache();
+
+                this.logger.info(`Prompt updated: ${id}`);
+                return updatedPrompt;
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Update prompt');
+                throw new Error('Failed to update prompt: ' + error.message);
+            }
+        }
+
+        deletePrompt(id) {
+            try {
+                if (!this.storage) {
+                    throw new Error('Storage manager not available');
+                }
+
+                // Delete from storage
+                const success = this.storage.deletePrompt(id);
+
+                if (success) {
+                    // Clear search cache since data changed
+                    this.clearSearchCache();
+                    this.logger.info(`Prompt deleted: ${id}`);
+                }
+
+                return success;
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Delete prompt');
+                throw new Error('Failed to delete prompt: ' + error.message);
+            }
+        }
+
+        getPrompt(id) {
+            try {
+                if (!this.storage) {
+                    throw new Error('Storage manager not available');
+                }
+
+                return this.storage.getPrompt(id);
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Get prompt');
+                return null;
+            }
+        }
+
+        // Increment usage count for a prompt
+        incrementUsageCount(id) {
+            try {
+                const prompt = this.getPrompt(id);
+                if (prompt) {
+                    const newUsageCount = (prompt.usage_count || 0) + 1;
+                    return this.updatePrompt(id, { usage_count: newUsageCount });
+                }
+                return null;
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Increment usage count');
+                return null;
+            }
+        }
+
+        // Get popular prompts based on usage
+        getPopularPrompts(limit = 10) {
+            return this.getAllPrompts({
+                sortBy: 'usage',
+                sortOrder: 'desc',
+                limit: limit
+            });
+        }
+
+        // Get recently used prompts
+        getRecentPrompts(limit = 10) {
+            return this.getAllPrompts({
+                sortBy: 'date',
+                sortOrder: 'desc',
+                limit: limit
+            });
+        }
+
+        // Search suggestions based on partial query
+        getSearchSuggestions(partialQuery, limit = 5) {
+            if (!partialQuery || partialQuery.length < 2) {
+                return [];
+            }
+
+            const allPrompts = this.getAllPrompts();
+            const suggestions = new Set();
+
+            // Add prompt names that start with the query
+            allPrompts.forEach(prompt => {
+                if (prompt.name.toLowerCase().startsWith(partialQuery.toLowerCase())) {
+                    suggestions.add(prompt.name);
+                }
+            });
+
+            // Add tags that start with the query
+            allPrompts.forEach(prompt => {
+                if (prompt.tags) {
+                    prompt.tags.forEach(tag => {
+                        if (tag.toLowerCase().startsWith(partialQuery.toLowerCase())) {
+                            suggestions.add(tag);
+                        }
+                    });
+                }
+            });
+
+            return Array.from(suggestions).slice(0, limit);
+        }
+
+        // Process prompt template with variables
+        async processPromptTemplate(prompt, variables = {}) {
+            try {
+                if (!prompt || !prompt.content) {
+                    throw new Error('Invalid prompt object');
+                }
+
+                // Check if template engine is available
+                if (!this.templateEngine) {
+                    this.logger.warn('TemplateEngine not available, returning original content');
+                    return prompt.content;
+                }
+
+                // Process template with variables
+                const processedContent = await this.templateEngine.processTemplate(prompt.content, variables);
+
+                this.logger.debug(`Processed prompt template for: ${prompt.name}`);
+                return processedContent;
+
+            } catch (error) {
+                this.errorHandler.handleTemplateError(error, prompt.content);
+                // Return original content if processing fails
+                return prompt.content;
+            }
+        }
+
+        // Check if prompt has template variables
+        hasTemplateVariables(prompt) {
+            if (!prompt || !prompt.content) {
+                return false;
+            }
+
+            return this.templateEngine ? this.templateEngine.hasVariables(prompt.content) : false;
+        }
+
+        // Get variable names from prompt template
+        getPromptVariables(prompt) {
+            if (!prompt || !prompt.content || !this.templateEngine) {
+                return [];
+            }
+
+            return this.templateEngine.getVariableNames(prompt.content);
+        }
+
+        async initialize() {
+            this.logger.info('Initializing PromptEngine');
+
+            // Validate storage dependency
+            if (!this.storage) {
+                this.logger.warn('PromptEngine initialized without storage manager');
+            }
+
+            // Validate template engine dependency
+            if (!this.templateEngine) {
+                this.logger.warn('PromptEngine initialized without template engine');
+            }
+
+            this.logger.info('PromptEngine initialized successfully');
+        }
+    }
+
+    // Template Engine Class - Handles variable processing and template substitution
+    class TemplateEngine {
+        constructor(dependencies = {}) {
+            this.logger = dependencies.logger || EZPrompt.logger;
+            this.errorHandler = dependencies.errorHandler || EZPrompt.errorHandler;
+            this.storage = dependencies.storage;
+
+            // Variable configuration
+            this.variableConfig = {
+                pattern: /\{([^}]+)\}/g,           // Pattern to match {variable} syntax
+                defaultSeparator: '|',             // Separator for default values: {var|default}
+                maxHistorySize: 50,                // Maximum number of variable values to remember
+                dialogTimeout: 30000               // Timeout for variable input dialog (30 seconds)
+            };
+
+            // Variable history for quick selection
+            this.variableHistory = this.loadVariableHistory();
+
+            // Predefined variable types and their handlers
+            this.variableTypes = {
+                text: this.handleTextVariable.bind(this),
+                select: this.handleSelectVariable.bind(this),
+                date: this.handleDateVariable.bind(this),
+                time: this.handleTimeVariable.bind(this)
+            };
+
+            // Common predefined variables
+            this.predefinedVariables = {
+                'current_date': () => new Date().toLocaleDateString(),
+                'current_time': () => new Date().toLocaleTimeString(),
+                'current_datetime': () => new Date().toLocaleString(),
+                'current_year': () => new Date().getFullYear().toString(),
+                'current_month': () => (new Date().getMonth() + 1).toString(),
+                'current_day': () => new Date().getDate().toString()
+            };
+        }
+
+        // Main method to process template with variables
+        async processTemplate(template, variables = {}) {
+            try {
+                if (!template || typeof template !== 'string') {
+                    throw new Error('Template must be a non-empty string');
+                }
+
+                this.logger.debug('Processing template with variables:', { template, variables });
+
+                // Find all variables in the template
+                const foundVariables = this.extractVariables(template);
+
+                if (foundVariables.length === 0) {
+                    this.logger.debug('No variables found in template');
+                    return template;
+                }
+
+                // Resolve variable values
+                const resolvedVariables = await this.resolveVariables(foundVariables, variables);
+
+                // Replace variables in template
+                const processedTemplate = this.replaceVariables(template, resolvedVariables);
+
+                // Update variable history
+                this.updateVariableHistory(resolvedVariables);
+
+                this.logger.debug('Template processed successfully:', processedTemplate);
+                return processedTemplate;
+
+            } catch (error) {
+                this.errorHandler.handleTemplateError(error, template);
+                throw error;
+            }
+        }
+
+        // Extract all variables from template
+        extractVariables(template) {
+            const variables = [];
+            const matches = template.matchAll(this.variableConfig.pattern);
+
+            for (const match of matches) {
+                const fullMatch = match[0];
+                const variableExpression = match[1];
+
+                // Parse variable name and default value
+                const [name, defaultValue] = variableExpression.split(this.variableConfig.defaultSeparator, 2);
+
+                variables.push({
+                    fullMatch,
+                    name: name.trim(),
+                    defaultValue: defaultValue ? defaultValue.trim() : null,
+                    expression: variableExpression
+                });
+            }
+
+            // Remove duplicates based on variable name
+            const uniqueVariables = variables.filter((variable, index, array) =>
+                array.findIndex(v => v.name === variable.name) === index
+            );
+
+            this.logger.debug(`Extracted ${uniqueVariables.length} unique variables:`, uniqueVariables);
+            return uniqueVariables;
+        }
+
+        // Resolve variable values through various methods
+        async resolveVariables(variables, providedValues = {}) {
+            const resolvedVariables = {};
+
+            for (const variable of variables) {
+                const { name, defaultValue } = variable;
+
+                // Check if value is already provided
+                if (providedValues.hasOwnProperty(name)) {
+                    resolvedVariables[name] = providedValues[name];
+                    continue;
+                }
+
+                // Check predefined variables
+                if (this.predefinedVariables.hasOwnProperty(name)) {
+                    try {
+                        resolvedVariables[name] = this.predefinedVariables[name]();
+                        continue;
+                    } catch (error) {
+                        this.logger.warn(`Failed to resolve predefined variable ${name}:`, error);
+                    }
+                }
+
+                // Use default value if available
+                if (defaultValue !== null) {
+                    resolvedVariables[name] = defaultValue;
+                    continue;
+                }
+
+                // Prompt user for value
+                try {
+                    const userValue = await this.promptUserForVariable(variable);
+                    resolvedVariables[name] = userValue;
+                } catch (error) {
+                    this.logger.warn(`Failed to get user input for variable ${name}:`, error);
+                    resolvedVariables[name] = `{${name}}`;  // Keep original if failed
+                }
+            }
+
+            return resolvedVariables;
+        }
+
+        // Replace variables in template with resolved values
+        replaceVariables(template, resolvedVariables) {
+            let result = template;
+
+            // Replace each variable with its resolved value
+            for (const [name, value] of Object.entries(resolvedVariables)) {
+                // Create regex to match the variable with optional default value
+                const variableRegex = new RegExp(`\\{${this.escapeRegex(name)}(?:\\|[^}]*)?\\}`, 'g');
+                result = result.replace(variableRegex, value);
+            }
+
+            return result;
+        }
+
+        // Prompt user for variable value with dialog
+        async promptUserForVariable(variable) {
+            return new Promise((resolve, reject) => {
+                const { name, defaultValue } = variable;
+
+                // Create variable input dialog
+                const dialog = this.createVariableDialog(variable);
+                document.body.appendChild(dialog);
+
+                // Set up timeout
+                const timeout = setTimeout(() => {
+                    this.closeVariableDialog(dialog);
+                    reject(new Error(`Variable input timeout for: ${name}`));
+                }, this.variableConfig.dialogTimeout);
+
+                // Handle dialog result
+                const handleResult = (value) => {
+                    clearTimeout(timeout);
+                    this.closeVariableDialog(dialog);
+                    resolve(value || defaultValue || '');
+                };
+
+                // Set up event listeners
+                const input = dialog.querySelector('.ezprompt-variable-input');
+                const confirmBtn = dialog.querySelector('.ezprompt-variable-confirm');
+                const cancelBtn = dialog.querySelector('.ezprompt-variable-cancel');
+                const historySelect = dialog.querySelector('.ezprompt-variable-history');
+
+                // Confirm button
+                confirmBtn.addEventListener('click', () => {
+                    handleResult(input.value);
+                });
+
+                // Cancel button
+                cancelBtn.addEventListener('click', () => {
+                    handleResult(defaultValue || '');
+                });
+
+                // Enter key in input
+                input.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') {
+                        e.preventDefault();
+                        handleResult(input.value);
+                    } else if (e.key === 'Escape') {
+                        e.preventDefault();
+                        handleResult(defaultValue || '');
+                    }
+                });
+
+                // History selection
+                if (historySelect) {
+                    historySelect.addEventListener('change', () => {
+                        if (historySelect.value) {
+                            input.value = historySelect.value;
+                            input.focus();
+                        }
+                    });
+                }
+
+                // Focus input
+                input.focus();
+                if (defaultValue) {
+                    input.value = defaultValue;
+                    input.select();
+                }
+            });
+        }
+
+        // Create variable input dialog
+        createVariableDialog(variable) {
+            const { name, defaultValue } = variable;
+
+            // Create dialog container
+            const dialog = document.createElement('div');
+            dialog.className = 'ezprompt-variable-dialog';
+
+            // Get variable history for this variable
+            const history = this.getVariableHistory(name);
+
+            // Create dialog HTML
+            dialog.innerHTML = `
+                <div class="ezprompt-variable-overlay"></div>
+                <div class="ezprompt-variable-content">
+                    <div class="ezprompt-variable-header">
+                        <h3>Enter Variable Value</h3>
+                        <button class="ezprompt-variable-close" type="button">×</button>
+                    </div>
+                    <div class="ezprompt-variable-body">
+                        <label class="ezprompt-variable-label">
+                            Variable: <strong>${this.escapeHtml(name)}</strong>
+                        </label>
+                        ${history.length > 0 ? `
+                            <label class="ezprompt-variable-label">
+                                Recent values:
+                                <select class="ezprompt-variable-history">
+                                    <option value="">Select from history...</option>
+                                    ${history.map(value =>
+                `<option value="${this.escapeHtml(value)}">${this.escapeHtml(value)}</option>`
+            ).join('')}
+                                </select>
+                            </label>
+                        ` : ''}
+                        <label class="ezprompt-variable-label">
+                            Value:
+                            <input type="text" class="ezprompt-variable-input" 
+                                   placeholder="${defaultValue ? `Default: ${this.escapeHtml(defaultValue)}` : 'Enter value...'}" />
+                        </label>
+                    </div>
+                    <div class="ezprompt-variable-footer">
+                        <button class="ezprompt-variable-cancel" type="button">Cancel</button>
+                        <button class="ezprompt-variable-confirm" type="button">Confirm</button>
+                    </div>
+                </div>
+            `;
+
+            // Add styles if not already added
+            this.addVariableDialogStyles();
+
+            return dialog;
+        }
+
+        // Close variable dialog
+        closeVariableDialog(dialog) {
+            if (dialog && dialog.parentNode) {
+                dialog.parentNode.removeChild(dialog);
+            }
+        }
+
+        // Handle different variable types
+        async handleTextVariable(variable, options = {}) {
+            // Text variables are handled by the default prompt dialog
+            return this.promptUserForVariable(variable);
+        }
+
+        async handleSelectVariable(variable, options = {}) {
+            const { choices = [] } = options;
+
+            if (choices.length === 0) {
+                // Fall back to text input if no choices provided
+                return this.handleTextVariable(variable, options);
+            }
+
+            // Create select dialog (simplified implementation)
+            return new Promise((resolve) => {
+                const value = prompt(`Select value for ${variable.name}:\n${choices.map((choice, i) => `${i + 1}. ${choice}`).join('\n')}`);
+                const index = parseInt(value) - 1;
+                resolve(choices[index] || variable.defaultValue || '');
+            });
+        }
+
+        async handleDateVariable(variable, options = {}) {
+            const { format = 'YYYY-MM-DD' } = options;
+            const today = new Date().toISOString().split('T')[0];
+
+            return new Promise((resolve) => {
+                const value = prompt(`Enter date for ${variable.name} (${format}):`, variable.defaultValue || today);
+                resolve(value || variable.defaultValue || today);
+            });
+        }
+
+        async handleTimeVariable(variable, options = {}) {
+            const { format = 'HH:MM' } = options;
+            const now = new Date().toTimeString().split(' ')[0].substring(0, 5);
+
+            return new Promise((resolve) => {
+                const value = prompt(`Enter time for ${variable.name} (${format}):`, variable.defaultValue || now);
+                resolve(value || variable.defaultValue || now);
+            });
+        }
+
+        // Variable history management
+        loadVariableHistory() {
+            try {
+                const historyData = GM_getValue('ezprompt_variable_history', '{}');
+                return EZPrompt.utils.safeJsonParse(historyData, {});
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'variable history');
+                return {};
+            }
+        }
+
+        saveVariableHistory() {
+            try {
+                GM_setValue('ezprompt_variable_history', EZPrompt.utils.safeJsonStringify(this.variableHistory));
+            } catch (error) {
+                this.errorHandler.handleDataError(error, this.variableHistory);
+            }
+        }
+
+        getVariableHistory(variableName) {
+            return this.variableHistory[variableName] || [];
+        }
+
+        updateVariableHistory(resolvedVariables) {
+            for (const [name, value] of Object.entries(resolvedVariables)) {
+                if (!value || value.startsWith('{')) continue; // Skip empty or unresolved variables
+
+                if (!this.variableHistory[name]) {
+                    this.variableHistory[name] = [];
+                }
+
+                const history = this.variableHistory[name];
+
+                // Remove existing occurrence
+                const existingIndex = history.indexOf(value);
+                if (existingIndex !== -1) {
+                    history.splice(existingIndex, 1);
+                }
+
+                // Add to beginning
+                history.unshift(value);
+
+                // Limit history size
+                if (history.length > this.variableConfig.maxHistorySize) {
+                    history.splice(this.variableConfig.maxHistorySize);
+                }
+            }
+
+            this.saveVariableHistory();
+        }
+
+        // Add CSS styles for variable dialog
+        addVariableDialogStyles() {
+            if (document.getElementById('ezprompt-variable-styles')) {
+                return; // Styles already added
+            }
+
+            const styles = `
+                .ezprompt-variable-dialog {
+                    position: fixed !important;
+                    top: 0 !important;
+                    left: 0 !important;
+                    width: 100% !important;
+                    height: 100% !important;
+                    z-index: 10002 !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    justify-content: center !important;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+                }
+
+                .ezprompt-variable-overlay {
+                    position: absolute !important;
+                    top: 0 !important;
+                    left: 0 !important;
+                    width: 100% !important;
+                    height: 100% !important;
+                    background: rgba(0, 0, 0, 0.5) !important;
+                    backdrop-filter: blur(4px) !important;
+                    -webkit-backdrop-filter: blur(4px) !important;
+                }
+
+                .ezprompt-variable-content {
+                    position: relative !important;
+                    width: 400px !important;
+                    max-width: 90vw !important;
+                    background: white !important;
+                    border-radius: 12px !important;
+                    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.2) !important;
+                    overflow: hidden !important;
+                }
+
+                .ezprompt-variable-header {
+                    display: flex !important;
+                    align-items: center !important;
+                    justify-content: space-between !important;
+                    padding: 20px !important;
+                    border-bottom: 1px solid #e5e7eb !important;
+                    background: #f9fafb !important;
+                }
+
+                .ezprompt-variable-header h3 {
+                    margin: 0 !important;
+                    font-size: 18px !important;
+                    font-weight: 600 !important;
+                    color: #111827 !important;
+                }
+
+                .ezprompt-variable-close {
+                    width: 32px !important;
+                    height: 32px !important;
+                    border: none !important;
+                    background: rgba(239, 68, 68, 0.1) !important;
+                    color: #dc2626 !important;
+                    border-radius: 6px !important;
+                    cursor: pointer !important;
+                    font-size: 18px !important;
+                    font-weight: bold !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    justify-content: center !important;
+                }
+
+                .ezprompt-variable-body {
+                    padding: 20px !important;
+                    display: flex !important;
+                    flex-direction: column !important;
+                    gap: 16px !important;
+                }
+
+                .ezprompt-variable-label {
+                    display: flex !important;
+                    flex-direction: column !important;
+                    gap: 6px !important;
+                    font-size: 14px !important;
+                    font-weight: 500 !important;
+                    color: #374151 !important;
+                }
+
+                .ezprompt-variable-input,
+                .ezprompt-variable-history {
+                    padding: 10px 12px !important;
+                    border: 1px solid #d1d5db !important;
+                    border-radius: 6px !important;
+                    font-size: 14px !important;
+                    font-family: inherit !important;
+                    background: white !important;
+                    transition: border-color 0.2s ease !important;
+                }
+
+                .ezprompt-variable-input:focus,
+                .ezprompt-variable-history:focus {
+                    outline: none !important;
+                    border-color: #4f46e5 !important;
+                    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1) !important;
+                }
+
+                .ezprompt-variable-footer {
+                    display: flex !important;
+                    gap: 12px !important;
+                    padding: 20px !important;
+                    border-top: 1px solid #e5e7eb !important;
+                    background: #f9fafb !important;
+                    justify-content: flex-end !important;
+                }
+
+                .ezprompt-variable-cancel,
+                .ezprompt-variable-confirm {
+                    padding: 8px 16px !important;
+                    border: 1px solid #d1d5db !important;
+                    border-radius: 6px !important;
+                    font-size: 14px !important;
+                    font-weight: 500 !important;
+                    cursor: pointer !important;
+                    transition: all 0.2s ease !important;
+                }
+
+                .ezprompt-variable-cancel {
+                    background: white !important;
+                    color: #374151 !important;
+                }
+
+                .ezprompt-variable-cancel:hover {
+                    background: #f3f4f6 !important;
+                }
+
+                .ezprompt-variable-confirm {
+                    background: #4f46e5 !important;
+                    color: white !important;
+                    border-color: #4f46e5 !important;
+                }
+
+                .ezprompt-variable-confirm:hover {
+                    background: #4338ca !important;
+                    border-color: #4338ca !important;
+                }
+
+                /* Dark theme support */
+                @media (prefers-color-scheme: dark) {
+                    .ezprompt-variable-content {
+                        background: #1f2937 !important;
+                        color: #f9fafb !important;
+                    }
+
+                    .ezprompt-variable-header {
+                        background: #111827 !important;
+                        border-bottom-color: #374151 !important;
+                    }
+
+                    .ezprompt-variable-header h3 {
+                        color: #f9fafb !important;
+                    }
+
+                    .ezprompt-variable-input,
+                    .ezprompt-variable-history {
+                        background: #374151 !important;
+                        border-color: #4b5563 !important;
+                        color: #f9fafb !important;
+                    }
+
+                    .ezprompt-variable-footer {
+                        background: #111827 !important;
+                        border-top-color: #374151 !important;
+                    }
+
+                    .ezprompt-variable-cancel {
+                        background: #374151 !important;
+                        color: #f9fafb !important;
+                        border-color: #4b5563 !important;
+                    }
+
+                    .ezprompt-variable-cancel:hover {
+                        background: #4b5563 !important;
+                    }
+                }
+            `;
+
+            const styleSheet = document.createElement('style');
+            styleSheet.id = 'ezprompt-variable-styles';
+            styleSheet.textContent = styles;
+            document.head.appendChild(styleSheet);
+        }
+
+        // Utility methods
+        escapeRegex(string) {
+            return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        }
+
+        escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Public API methods
+
+        // Check if template contains variables
+        hasVariables(template) {
+            return this.variableConfig.pattern.test(template);
+        }
+
+        // Get list of variables in template
+        getVariableNames(template) {
+            const variables = this.extractVariables(template);
+            return variables.map(v => v.name);
+        }
+
+        // Clear variable history
+        clearVariableHistory(variableName = null) {
+            if (variableName) {
+                delete this.variableHistory[variableName];
+            } else {
+                this.variableHistory = {};
+            }
+            this.saveVariableHistory();
+        }
+
+        // Add predefined variable
+        addPredefinedVariable(name, handler) {
+            if (typeof handler === 'function') {
+                this.predefinedVariables[name] = handler;
+            } else {
+                this.predefinedVariables[name] = () => String(handler);
+            }
+        }
+
+        // Remove predefined variable
+        removePredefinedVariable(name) {
+            delete this.predefinedVariables[name];
+        }
+
+        // Get all predefined variables
+        getPredefinedVariables() {
+            return Object.keys(this.predefinedVariables);
+        }
+
+        // Initialize the template engine
+        async initialize() {
+            this.logger.info('Initializing TemplateEngine');
+
+            // Load variable history
+            this.variableHistory = this.loadVariableHistory();
+
+            this.logger.info('TemplateEngine initialized successfully');
+        }
+    }
+
+    // UI Manager Class
+    class UIManager {
+        constructor(dependencies = {}) {
+            this.logger = dependencies.logger || EZPrompt.logger;
+            this.errorHandler = dependencies.errorHandler || EZPrompt.errorHandler;
+            this.siteDetection = dependencies.siteDetection;
+            this.storage = dependencies.storage;
+
+            // UI state management
+            this.activeButtons = new Map(); // inputElement -> buttonElement
+            this.promptPanel = null;
+            this.autocompletePanel = null;
+            this.currentInputElement = null;
+
+            // Button configuration
+            this.buttonConfig = {
+                size: 24,
+                offset: { x: 8, y: 8 },
+                zIndex: 10000,
+                className: 'ezprompt-button'
+            };
+
+            // Panel configuration
+            this.panelConfig = {
+                maxWidth: 400,
+                maxHeight: 500,
+                zIndex: 10001,
+                className: 'ezprompt-panel'
+            };
+
+            // Autocomplete configuration
+            this.autocompleteConfig = {
+                maxItems: 8,
+                itemHeight: 40,
+                maxWidth: 300,
+                zIndex: 10002,
+                className: 'ezprompt-autocomplete'
+            };
+
+            // Autocomplete state
+            this.selectedIndex = -1;
+
+            // Settings panel state
+            this.settingsPanel = null;
+            this.settingsPanelVisible = false;
+
+            // Statistics tracking
+            this.statisticsData = {
+                totalInsertions: 0,
+                sessionInsertions: 0,
+                sessionStart: Date.now()
+            };
+
+            // Multi-language support
+            this.currentLanguage = 'en';
+            this.translations = this.initializeTranslations();
+
+            // Initialize styles
+            this.initializeStyles();
+        }
+
+        // Initialize translation system
+        initializeTranslations() {
+            return {
+                'en': {
+                    'button.prompts': 'Prompts',
+                    'button.settings': 'Settings',
+                    'panel.search': 'Search prompts...',
+                    'panel.category': 'Category',
+                    'panel.all_categories': 'All Categories',
+                    'panel.no_prompts': 'No prompts found',
+                    'panel.prompts_count': '{count} prompts',
+                    'settings.title': 'EZPrompt Settings',
+                    'settings.theme': 'Theme',
+                    'settings.theme.light': 'Light',
+                    'settings.theme.dark': 'Dark',
+                    'settings.theme.auto': 'Auto',
+                    'settings.language': 'Language',
+                    'settings.language.en': 'English',
+                    'settings.language.zh': '中文',
+                    'settings.insertion_mode': 'Insertion Mode',
+                    'settings.insertion_mode.replace': 'Replace',
+                    'settings.insertion_mode.prefix': 'Prefix',
+                    'settings.insertion_mode.suffix': 'Suffix',
+                    'settings.statistics': 'Usage Statistics',
+                    'settings.popular_prompts': 'Popular Prompts',
+                    'settings.batch_operations': 'Batch Operations',
+                    'settings.export_all': 'Export All',
+                    'settings.import_data': 'Import Data',
+                    'settings.clear_stats': 'Clear Statistics',
+                    'stats.total_insertions': 'Total Insertions',
+                    'stats.session_insertions': 'Session Insertions',
+                    'stats.most_used': 'Most Used Prompt',
+                    'stats.session_time': 'Session Time',
+                    'batch.select_all': 'Select All',
+                    'batch.delete_selected': 'Delete Selected',
+                    'batch.export_selected': 'Export Selected',
+                    'batch.move_to_category': 'Move to Category',
+                    'error.sync_failed': 'Sync failed',
+                    'error.import_failed': 'Import failed',
+                    'success.settings_saved': 'Settings saved',
+                    'success.data_exported': 'Data exported successfully',
+                    'settings.export_csv': 'Export CSV',
+                    'settings.custom_site_tool': 'Custom Site Selector',
+                    'custom_site.selector.title': 'Create Custom Site',
+                    'custom_site.selector.domain': 'Domains (comma separated)',
+                    'custom_site.selector.site_id': 'Site ID',
+                    'custom_site.selector.site_name': 'Site Name',
+                    'custom_site.selector.save': 'Save Site',
+                    'custom_site.selector.cancel': 'Cancel',
+                    'custom_site.selector.hint': 'Click a target input element to capture selector',
+                    'success.csv_exported': 'CSV exported successfully'
+                },
+                'zh': {
+                    'button.prompts': '提示词',
+                    'button.settings': '设置',
+                    'panel.search': '搜索提示词...',
+                    'panel.category': '分类',
+                    'panel.all_categories': '所有分类',
+                    'panel.no_prompts': '未找到提示词',
+                    'panel.prompts_count': '{count} 个提示词',
+                    'settings.title': 'EZPrompt 设置',
+                    'settings.theme': '主题',
+                    'settings.theme.light': '浅色',
+                    'settings.theme.dark': '深色',
+                    'settings.theme.auto': '自动',
+                    'settings.language': '语言',
+                    'settings.language.en': 'English',
+                    'settings.language.zh': '中文',
+                    'settings.insertion_mode': '插入模式',
+                    'settings.insertion_mode.replace': '替换',
+                    'settings.insertion_mode.prefix': '前缀',
+                    'settings.insertion_mode.suffix': '后缀',
+                    'settings.statistics': '使用统计',
+                    'settings.popular_prompts': '热门提示词',
+                    'settings.batch_operations': '批量操作',
+                    'settings.export_all': '导出全部',
+                    'settings.import_data': '导入数据',
+                    'settings.clear_stats': '清除统计',
+                    'stats.total_insertions': '总插入次数',
+                    'stats.session_insertions': '本次会话插入',
+                    'stats.most_used': '最常用提示词',
+                    'stats.session_time': '会话时长',
+                    'batch.select_all': '全选',
+                    'batch.delete_selected': '删除选中',
+                    'batch.export_selected': '导出选中',
+                    'batch.move_to_category': '移动到分类',
+                    'error.sync_failed': '同步失败',
+                    'error.import_failed': '导入失败',
+                    'success.settings_saved': '设置已保存',
+                    'success.data_exported': '数据导出成功',
+                    'settings.export_csv': '导出 CSV',
+                    'settings.custom_site_tool': '自定义站点选择器',
+                    'custom_site.selector.title': '创建自定义站点',
+                    'custom_site.selector.domain': '域名(逗号分隔)',
+                    'custom_site.selector.site_id': '站点ID',
+                    'custom_site.selector.site_name': '站点名称',
+                    'custom_site.selector.save': '保存站点',
+                    'custom_site.selector.cancel': '取消',
+                    'custom_site.selector.hint': '点击目标输入框以获取选择器',
+                    'success.csv_exported': 'CSV 导出成功'
+                }
+            };
+        }
+
+        // Get translated text
+        t(key, params = {}) {
+            const translation = this.translations[this.currentLanguage]?.[key] ||
+                this.translations['en']?.[key] ||
+                key;
+
+            // Replace parameters in translation
+            return translation.replace(/\{(\w+)\}/g, (match, param) => {
+                return params[param] !== undefined ? params[param] : match;
+            });
+        }
+
+        // Set current language
+        setLanguage(language) {
+            if (this.translations[language]) {
+                this.currentLanguage = language;
+                this.updateUILanguage();
+                this.logger.info(`Language changed to: ${language}`);
+            }
+        }
+
+        // Update UI elements with new language
+        updateUILanguage() {
+            // Update existing UI elements if they exist
+            if (this.promptPanel) {
+                this.updatePromptPanelLanguage();
+            }
+            if (this.settingsPanel) {
+                this.updateSettingsPanelLanguage();
+            }
+        }
+
+        // Initialize CSS styles for UI components
+        initializeStyles() {
+            if (document.getElementById('ezprompt-styles')) {
+                return; // Styles already initialized
+            }
+
+            const styles = `
+                /* EZPrompt Button Styles */
+                .ezprompt-button {
+                    position: absolute !important;
+                    width: 24px !important;
+                    height: 24px !important;
+                    background: #4f46e5 !important;
+                    border: none !important;
+                    border-radius: 6px !important;
+                    cursor: pointer !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    justify-content: center !important;
+                    font-size: 12px !important;
+                    color: white !important;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+                    font-weight: 500 !important;
+                    box-shadow: 0 2px 8px rgba(79, 70, 229, 0.3) !important;
+                    transition: all 0.2s ease !important;
+                    z-index: 10000 !important;
+                    opacity: 0.9 !important;
+                    user-select: none !important;
+                    -webkit-user-select: none !important;
+                    -moz-user-select: none !important;
+                    -ms-user-select: none !important;
+                }
+
+                .ezprompt-button:hover {
+                    background: #4338ca !important;
+                    opacity: 1 !important;
+                    transform: translateY(-1px) !important;
+                    box-shadow: 0 4px 12px rgba(79, 70, 229, 0.4) !important;
+                }
+
+                .ezprompt-button:active {
+                    transform: translateY(0) !important;
+                    box-shadow: 0 2px 6px rgba(79, 70, 229, 0.3) !important;
+                }
+
+                .ezprompt-button:focus {
+                    outline: 2px solid #818cf8 !important;
+                    outline-offset: 2px !important;
+                }
+
+                /* Dark theme support */
+                @media (prefers-color-scheme: dark) {
+                    .ezprompt-button {
+                        background: #6366f1 !important;
+                        box-shadow: 0 2px 8px rgba(99, 102, 241, 0.3) !important;
+                    }
+                    
+                    .ezprompt-button:hover {
+                        background: #5b21b6 !important;
+                        box-shadow: 0 4px 12px rgba(99, 102, 241, 0.4) !important;
+                    }
+                }
+
+                /* Button hidden state */
+                .ezprompt-button.hidden {
+                    opacity: 0 !important;
+                    pointer-events: none !important;
+                    transform: scale(0.8) !important;
+                }
+
+                /* Prompt Panel Styles */
+                .ezprompt-panel {
+                    position: fixed !important;
+                    width: 400px !important;
+                    max-width: 90vw !important;
+                    height: 500px !important;
+                    max-height: 80vh !important;
+                    background: rgba(255, 255, 255, 0.95) !important;
+                    backdrop-filter: blur(10px) !important;
+                    -webkit-backdrop-filter: blur(10px) !important;
+                    border: 1px solid rgba(229, 231, 235, 0.8) !important;
+                    border-radius: 12px !important;
+                    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.15) !important;
+                    z-index: 10001 !important;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+                    opacity: 0 !important;
+                    transform: scale(0.95) translateY(-10px) !important;
+                    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+                    pointer-events: none !important;
+                    display: flex !important;
+                    flex-direction: column !important;
+                }
+
+                .ezprompt-panel.visible {
+                    opacity: 1 !important;
+                    transform: scale(1) translateY(0) !important;
+                    pointer-events: auto !important;
+                }
+
+                /* Panel Header */
+                .ezprompt-panel-header {
+                    display: flex !important;
+                    align-items: center !important;
+                    padding: 16px !important;
+                    border-bottom: 1px solid rgba(229, 231, 235, 0.6) !important;
+                    gap: 12px !important;
+                }
+
+                .ezprompt-search-input {
+                    flex: 1 !important;
+                    padding: 8px 12px !important;
+                    border: 1px solid rgba(209, 213, 219, 0.8) !important;
+                    border-radius: 6px !important;
+                    font-size: 14px !important;
+                    font-family: inherit !important;
+                    background: rgba(255, 255, 255, 0.8) !important;
+                    transition: all 0.2s ease !important;
+                }
+
+                .ezprompt-search-input:focus {
+                    outline: none !important;
+                    border-color: #4f46e5 !important;
+                    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1) !important;
+                }
+
+                .ezprompt-close-btn {
+                    width: 32px !important;
+                    height: 32px !important;
+                    border: none !important;
+                    background: rgba(239, 68, 68, 0.1) !important;
+                    color: #dc2626 !important;
+                    border-radius: 6px !important;
+                    cursor: pointer !important;
+                    font-size: 18px !important;
+                    font-weight: bold !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    justify-content: center !important;
+                    transition: all 0.2s ease !important;
+                }
+
+                .ezprompt-close-btn:hover {
+                    background: rgba(239, 68, 68, 0.2) !important;
+                }
+
+                /* Panel Content */
+                .ezprompt-panel-content {
+                    display: flex !important;
+                    flex: 1 !important;
+                    min-height: 0 !important;
+                }
+
+                /* Categories Section */
+                .ezprompt-categories {
+                    width: 140px !important;
+                    border-right: 1px solid rgba(229, 231, 235, 0.6) !important;
+                    display: flex !important;
+                    flex-direction: column !important;
+                }
+
+                .ezprompt-category-header {
+                    padding: 12px 16px 8px !important;
+                    font-size: 12px !important;
+                    font-weight: 600 !important;
+                    color: #6b7280 !important;
+                    text-transform: uppercase !important;
+                    letter-spacing: 0.05em !important;
+                }
+
+                .ezprompt-category-list {
+                    flex: 1 !important;
+                    overflow-y: auto !important;
+                }
+
+                .ezprompt-category-item {
+                    padding: 8px 16px !important;
+                    font-size: 14px !important;
+                    cursor: pointer !important;
+                    transition: all 0.2s ease !important;
+                    border-left: 3px solid transparent !important;
+                }
+
+                .ezprompt-category-item:hover {
+                    background: rgba(79, 70, 229, 0.05) !important;
+                }
+
+                .ezprompt-category-item.active {
+                    background: rgba(79, 70, 229, 0.1) !important;
+                    color: #4f46e5 !important;
+                    border-left-color: #4f46e5 !important;
+                    font-weight: 500 !important;
+                }
+
+                /* Prompts Section */
+                .ezprompt-prompts {
+                    flex: 1 !important;
+                    display: flex !important;
+                    flex-direction: column !important;
+                    min-width: 0 !important;
+                }
+
+                .ezprompt-prompts-header {
+                    padding: 12px 16px 8px !important;
+                    border-bottom: 1px solid rgba(229, 231, 235, 0.4) !important;
+                }
+
+                .ezprompt-prompts-count {
+                    font-size: 12px !important;
+                    font-weight: 600 !important;
+                    color: #6b7280 !important;
+                    text-transform: uppercase !important;
+                    letter-spacing: 0.05em !important;
+                }
+
+                .ezprompt-prompts-list {
+                    flex: 1 !important;
+                    overflow-y: auto !important;
+                    padding: 8px 0 !important;
+                }
+
+                .ezprompt-prompt-item {
+                    padding: 12px 16px !important;
+                    cursor: pointer !important;
+                    transition: all 0.2s ease !important;
+                    border-left: 3px solid transparent !important;
+                }
+
+                .ezprompt-prompt-item:hover {
+                    background: rgba(79, 70, 229, 0.05) !important;
+                    border-left-color: #4f46e5 !important;
+                }
+
+                .ezprompt-prompt-name {
+                    font-size: 14px !important;
+                    font-weight: 500 !important;
+                    color: #111827 !important;
+                    margin-bottom: 4px !important;
+                }
+
+                .ezprompt-prompt-preview {
+                    font-size: 12px !important;
+                    color: #6b7280 !important;
+                    line-height: 1.4 !important;
+                    margin-bottom: 4px !important;
+                }
+
+                .ezprompt-prompt-category {
+                    font-size: 11px !important;
+                    color: #9ca3af !important;
+                    font-weight: 500 !important;
+                }
+
+                .ezprompt-no-prompts {
+                    padding: 32px 16px !important;
+                    text-align: center !important;
+                    color: #6b7280 !important;
+                    font-size: 14px !important;
+                }
+
+                /* Dark theme support */
+                @media (prefers-color-scheme: dark) {
+                    .ezprompt-panel {
+                        background: rgba(31, 41, 55, 0.95) !important;
+                        border-color: rgba(55, 65, 81, 0.8) !important;
+                        color: #f9fafb !important;
+                    }
+
+                    .ezprompt-panel-header {
+                        border-bottom-color: rgba(55, 65, 81, 0.6) !important;
+                    }
+
+                    .ezprompt-search-input {
+                        background: rgba(55, 65, 81, 0.8) !important;
+                        border-color: rgba(75, 85, 99, 0.8) !important;
+                        color: #f9fafb !important;
+                    }
+
+                    .ezprompt-search-input::placeholder {
+                        color: #9ca3af !important;
+                    }
+
+                    .ezprompt-categories {
+                        border-right-color: rgba(55, 65, 81, 0.6) !important;
+                    }
+
+                    .ezprompt-category-header,
+                    .ezprompt-prompts-count {
+                        color: #9ca3af !important;
+                    }
+
+                    .ezprompt-category-item:hover,
+                    .ezprompt-prompt-item:hover {
+                        background: rgba(99, 102, 241, 0.1) !important;
+                    }
+
+                    .ezprompt-category-item.active {
+                        background: rgba(99, 102, 241, 0.2) !important;
+                        color: #a5b4fc !important;
+                        border-left-color: #6366f1 !important;
+                    }
+
+                    .ezprompt-prompt-name {
+                        color: #f9fafb !important;
+                    }
+
+                    .ezprompt-prompt-preview {
+                        color: #9ca3af !important;
+                    }
+
+                    .ezprompt-prompt-category {
+                        color: #6b7280 !important;
+                    }
+
+                    .ezprompt-prompts-header {
+                        border-bottom-color: rgba(55, 65, 81, 0.4) !important;
+                    }
+                }
+
+                /* Scrollbar styling */
+                .ezprompt-category-list::-webkit-scrollbar,
+                .ezprompt-prompts-list::-webkit-scrollbar {
+                    width: 6px !important;
+                }
+
+                .ezprompt-category-list::-webkit-scrollbar-track,
+                .ezprompt-prompts-list::-webkit-scrollbar-track {
+                    background: transparent !important;
+                }
+
+                .ezprompt-category-list::-webkit-scrollbar-thumb,
+                .ezprompt-prompts-list::-webkit-scrollbar-thumb {
+                    background: rgba(156, 163, 175, 0.4) !important;
+                    border-radius: 3px !important;
+                }
+
+                .ezprompt-category-list::-webkit-scrollbar-thumb:hover,
+                .ezprompt-prompts-list::-webkit-scrollbar-thumb:hover {
+                    background: rgba(156, 163, 175, 0.6) !important;
+                }
+
+                /* Autocomplete Styles */
+                .ezprompt-autocomplete {
+                    position: fixed !important;
+                    min-width: 200px !important;
+                    max-width: 300px !important;
+                    max-height: 320px !important;
+                    background: rgba(255, 255, 255, 0.98) !important;
+                    backdrop-filter: blur(12px) !important;
+                    -webkit-backdrop-filter: blur(12px) !important;
+                    border: 1px solid rgba(229, 231, 235, 0.8) !important;
+                    border-radius: 8px !important;
+                    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.15) !important;
+                    z-index: 10002 !important;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+                    overflow: hidden !important;
+                    opacity: 0 !important;
+                    transform: translateY(-5px) !important;
+                    transition: all 0.15s cubic-bezier(0.4, 0, 0.2, 1) !important;
+                    pointer-events: none !important;
+                }
+
+                .ezprompt-autocomplete.visible {
+                    opacity: 1 !important;
+                    transform: translateY(0) !important;
+                    pointer-events: auto !important;
+                }
+
+                .ezprompt-autocomplete-item {
+                    padding: 8px 12px !important;
+                    cursor: pointer !important;
+                    border-bottom: 1px solid rgba(229, 231, 235, 0.5) !important;
+                    transition: background-color 0.1s ease !important;
+                    display: flex !important;
+                    flex-direction: column !important;
+                    gap: 2px !important;
+                }
+
+                .ezprompt-autocomplete-item:last-child {
+                    border-bottom: none !important;
+                }
+
+                .ezprompt-autocomplete-item:hover,
+                .ezprompt-autocomplete-item.selected {
+                    background: rgba(79, 70, 229, 0.1) !important;
+                }
+
+                .ezprompt-autocomplete-item-name {
+                    font-size: 14px !important;
+                    font-weight: 500 !important;
+                    color: #1f2937 !important;
+                    margin: 0 !important;
+                    line-height: 1.2 !important;
+                }
+
+                .ezprompt-autocomplete-item-content {
+                    font-size: 12px !important;
+                    color: #6b7280 !important;
+                    margin: 0 !important;
+                    line-height: 1.3 !important;
+                    max-height: 32px !important;
+                    overflow: hidden !important;
+                    text-overflow: ellipsis !important;
+                    display: -webkit-box !important;
+                    -webkit-line-clamp: 2 !important;
+                    -webkit-box-orient: vertical !important;
+                }
+
+                .ezprompt-autocomplete-item-category {
+                    font-size: 11px !important;
+                    color: #9ca3af !important;
+                    font-weight: 400 !important;
+                    text-transform: uppercase !important;
+                    letter-spacing: 0.5px !important;
+                    margin: 0 !important;
+                }
+
+                /* Dark theme support for autocomplete */
+                @media (prefers-color-scheme: dark) {
+                    .ezprompt-autocomplete {
+                        background: rgba(31, 41, 55, 0.98) !important;
+                        border-color: rgba(75, 85, 99, 0.8) !important;
+                    }
+                    
+                    .ezprompt-autocomplete-item {
+                        border-bottom-color: rgba(75, 85, 99, 0.5) !important;
+                    }
+                    
+                    .ezprompt-autocomplete-item:hover,
+                    .ezprompt-autocomplete-item.selected {
+                        background: rgba(99, 102, 241, 0.2) !important;
+                    }
+                    
+                    .ezprompt-autocomplete-item-name {
+                        color: #f9fafb !important;
+                    }
+                    
+                    .ezprompt-autocomplete-item-content {
+                        color: #d1d5db !important;
+                    }
+                    
+                    .ezprompt-autocomplete-item-category {
+                        color: #9ca3af !important;
+                    }
+                }
+
+                /* Settings Panel Styles */
+                .ezprompt-settings-panel {
+                    position: fixed !important;
+                    width: 500px !important;
+                    max-width: 90vw !important;
+                    height: 600px !important;
+                    max-height: 85vh !important;
+                    background: rgba(255, 255, 255, 0.95) !important;
+                    backdrop-filter: blur(10px) !important;
+                    -webkit-backdrop-filter: blur(10px) !important;
+                    border: 1px solid rgba(229, 231, 235, 0.8) !important;
+                    border-radius: 12px !important;
+                    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.15) !important;
+                    z-index: 10003 !important;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+                    opacity: 0 !important;
+                    transform: scale(0.95) translateY(-10px) !important;
+                    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
+                    pointer-events: none !important;
+                    display: flex !important;
+                    flex-direction: column !important;
+                }
+
+                .ezprompt-settings-panel.visible {
+                    opacity: 1 !important;
+                    transform: scale(1) translateY(0) !important;
+                    pointer-events: auto !important;
+                }
+
+                .ezprompt-settings-header {
+                    display: flex !important;
+                    align-items: center !important;
+                    justify-content: space-between !important;
+                    padding: 20px !important;
+                    border-bottom: 1px solid rgba(229, 231, 235, 0.6) !important;
+                }
+
+                .ezprompt-settings-title {
+                    font-size: 18px !important;
+                    font-weight: 600 !important;
+                    color: #111827 !important;
+                    margin: 0 !important;
+                }
+
+                .ezprompt-settings-content {
+                    flex: 1 !important;
+                    overflow-y: auto !important;
+                    padding: 20px !important;
+                }
+
+                .ezprompt-settings-section {
+                    margin-bottom: 24px !important;
+                }
+
+                .ezprompt-settings-section:last-child {
+                    margin-bottom: 0 !important;
+                }
+
+                .ezprompt-settings-section-title {
+                    font-size: 14px !important;
+                    font-weight: 600 !important;
+                    color: #374151 !important;
+                    margin-bottom: 12px !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    gap: 8px !important;
+                }
+
+                .ezprompt-settings-row {
+                    display: flex !important;
+                    align-items: center !important;
+                    justify-content: space-between !important;
+                    padding: 8px 0 !important;
+                }
+
+                .ezprompt-settings-label {
+                    font-size: 14px !important;
+                    color: #374151 !important;
+                    font-weight: 500 !important;
+                }
+
+                .ezprompt-settings-select {
+                    padding: 6px 12px !important;
+                    border: 1px solid rgba(209, 213, 219, 0.8) !important;
+                    border-radius: 6px !important;
+                    font-size: 14px !important;
+                    background: rgba(255, 255, 255, 0.8) !important;
+                    min-width: 120px !important;
+                    cursor: pointer !important;
+                }
+
+                .ezprompt-settings-select:focus {
+                    outline: none !important;
+                    border-color: #4f46e5 !important;
+                    box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1) !important;
+                }
+
+                .ezprompt-stats-grid {
+                    display: grid !important;
+                    grid-template-columns: 1fr 1fr !important;
+                    gap: 12px !important;
+                    margin-top: 12px !important;
+                }
+
+                .ezprompt-stat-card {
+                    padding: 12px !important;
+                    background: rgba(249, 250, 251, 0.8) !important;
+                    border: 1px solid rgba(229, 231, 235, 0.6) !important;
+                    border-radius: 8px !important;
+                    text-align: center !important;
+                }
+
+                .ezprompt-stat-value {
+                    font-size: 20px !important;
+                    font-weight: 700 !important;
+                    color: #4f46e5 !important;
+                    margin-bottom: 4px !important;
+                }
+
+                .ezprompt-stat-label {
+                    font-size: 12px !important;
+                    color: #6b7280 !important;
+                    font-weight: 500 !important;
+                }
+
+                .ezprompt-popular-list {
+                    max-height: 150px !important;
+                    overflow-y: auto !important;
+                    margin-top: 12px !important;
+                }
+
+                .ezprompt-popular-item {
+                    display: flex !important;
+                    justify-content: space-between !important;
+                    align-items: center !important;
+                    padding: 8px 12px !important;
+                    background: rgba(249, 250, 251, 0.8) !important;
+                    border: 1px solid rgba(229, 231, 235, 0.6) !important;
+                    border-radius: 6px !important;
+                    margin-bottom: 6px !important;
+                }
+
+                .ezprompt-popular-name {
+                    font-size: 13px !important;
+                    font-weight: 500 !important;
+                    color: #374151 !important;
+                    flex: 1 !important;
+                    text-overflow: ellipsis !important;
+                    overflow: hidden !important;
+                    white-space: nowrap !important;
+                }
+
+                .ezprompt-popular-count {
+                    font-size: 12px !important;
+                    color: #6b7280 !important;
+                    font-weight: 600 !important;
+                    background: rgba(79, 70, 229, 0.1) !important;
+                    padding: 2px 6px !important;
+                    border-radius: 4px !important;
+                }
+
+                .ezprompt-batch-controls {
+                    display: flex !important;
+                    gap: 8px !important;
+                    margin-top: 12px !important;
+                    flex-wrap: wrap !important;
+                }
+
+                .ezprompt-batch-btn {
+                    padding: 6px 12px !important;
+                    border: 1px solid rgba(209, 213, 219, 0.8) !important;
+                    border-radius: 6px !important;
+                    font-size: 12px !important;
+                    font-weight: 500 !important;
+                    background: rgba(255, 255, 255, 0.8) !important;
+                    color: #374151 !important;
+                    cursor: pointer !important;
+                    transition: all 0.2s ease !important;
+                }
+
+                .ezprompt-batch-btn:hover {
+                    background: rgba(79, 70, 229, 0.05) !important;
+                    border-color: #4f46e5 !important;
+                    color: #4f46e5 !important;
+                }
+
+                .ezprompt-batch-btn.danger {
+                    color: #dc2626 !important;
+                    border-color: rgba(220, 38, 38, 0.3) !important;
+                }
+
+                .ezprompt-batch-btn.danger:hover {
+                    background: rgba(220, 38, 38, 0.05) !important;
+                    border-color: #dc2626 !important;
+                }
+
+                /* Dark theme for settings */
+                @media (prefers-color-scheme: dark) {
+                    .ezprompt-settings-panel {
+                        background: rgba(31, 41, 55, 0.95) !important;
+                        border-color: rgba(55, 65, 81, 0.8) !important;
+                        color: #f9fafb !important;
+                    }
+
+                    .ezprompt-settings-header {
+                        border-bottom-color: rgba(55, 65, 81, 0.6) !important;
+                    }
+
+                    .ezprompt-settings-title {
+                        color: #f9fafb !important;
+                    }
+
+                    .ezprompt-settings-section-title,
+                    .ezprompt-settings-label {
+                        color: #e5e7eb !important;
+                    }
+
+                    .ezprompt-settings-select {
+                        background: rgba(55, 65, 81, 0.8) !important;
+                        border-color: rgba(75, 85, 99, 0.8) !important;
+                        color: #f9fafb !important;
+                    }
+
+                    .ezprompt-stat-card,
+                    .ezprompt-popular-item {
+                        background: rgba(55, 65, 81, 0.6) !important;
+                        border-color: rgba(75, 85, 99, 0.6) !important;
+                    }
+
+                    .ezprompt-stat-value {
+                        color: #a5b4fc !important;
+                    }
+
+                    .ezprompt-stat-label {
+                        color: #9ca3af !important;
+                    }
+
+                    .ezprompt-popular-name {
+                        color: #e5e7eb !important;
+                    }
+
+                    .ezprompt-popular-count {
+                        background: rgba(99, 102, 241, 0.2) !important;
+                        color: #a5b4fc !important;
+                    }
+
+                    .ezprompt-batch-btn {
+                        background: rgba(55, 65, 81, 0.8) !important;
+                        border-color: rgba(75, 85, 99, 0.8) !important;
+                        color: #e5e7eb !important;
+                    }
+
+                    .ezprompt-batch-btn:hover {
+                        background: rgba(99, 102, 241, 0.1) !important;
+                        border-color: #6366f1 !important;
+                        color: #a5b4fc !important;
+                    }
+
+                    .ezprompt-batch-btn.danger {
+                        color: #f87171 !important;
+                        border-color: rgba(248, 113, 113, 0.3) !important;
+                    }
+
+                    .ezprompt-batch-btn.danger:hover {
+                        background: rgba(248, 113, 113, 0.1) !important;
+                        border-color: #f87171 !important;
+                    }
+                }
+
+                /* Responsive design */
+                @media (max-width: 768px) {
+                    .ezprompt-panel {
+                        width: 95vw !important;
+                        height: 70vh !important;
+                    }
+
+                    .ezprompt-settings-panel {
+                        width: 95vw !important;
+                        height: 80vh !important;
+                    }
+
+                    .ezprompt-categories {
+                        width: 120px !important;
+                    }
+
+                    .ezprompt-stats-grid {
+                        grid-template-columns: 1fr !important;
+                    }
+
+                    .ezprompt-batch-controls {
+                        flex-direction: column !important;
+                    }
+
+                    .ezprompt-batch-btn {
+                        width: 100% !important;
+                        text-align: center !important;
+                    }
+                }
+
+                @media (max-width: 480px) {
+                    .ezprompt-panel-content {
+                        flex-direction: column !important;
+                    }
+
+                    .ezprompt-categories {
+                        width: 100% !important;
+                        height: 120px !important;
+                        border-right: none !important;
+                        border-bottom: 1px solid rgba(229, 231, 235, 0.6) !important;
+                    }
+
+                    .ezprompt-category-list {
+                        display: flex !important;
+                        overflow-x: auto !important;
+                        overflow-y: hidden !important;
+                        gap: 8px !important;
+                        padding: 8px 16px !important;
+                    }
+
+                    .ezprompt-category-item {
+                        white-space: nowrap !important;
+                        border-left: none !important;
+                        border-bottom: 3px solid transparent !important;
+                        padding: 8px 12px !important;
+                    }
+
+                    .ezprompt-category-item.active {
+                        border-left: none !important;
+                        border-bottom-color: #4f46e5 !important;
+                    }
+                }
+            `;
+
+            const styleElement = document.createElement('style');
+            styleElement.id = 'ezprompt-styles';
+            styleElement.textContent = styles;
+            document.head.appendChild(styleElement);
+
+            this.logger.debug('UI styles initialized');
+        }
+
+        // Create and position button for input element
+        createInputButton(inputElement) {
+            if (!inputElement) {
+                this.logger.warn('Cannot create button: input element is null');
+                return null;
+            }
+
+            // Check if button already exists for this input
+            if (this.activeButtons.has(inputElement)) {
+                this.logger.debug('Button already exists for input element');
+                return this.activeButtons.get(inputElement);
+            }
+
+            try {
+                // Create button element
+                const button = document.createElement('button');
+                button.className = this.buttonConfig.className;
+                button.textContent = 'P';
+                button.title = 'EZPrompt - Click to open prompt library (Ctrl+Shift+P)';
+                button.setAttribute('aria-label', 'Open prompt library');
+                button.setAttribute('type', 'button');
+
+                // Position button relative to input
+                this.positionButton(button, inputElement);
+
+                // Add event listeners
+                this.attachButtonEvents(button, inputElement);
+
+                // Insert button into DOM
+                document.body.appendChild(button);
+
+                // Store button reference
+                this.activeButtons.set(inputElement, button);
+
+                this.logger.debug('Input button created and positioned');
+                return button;
+
+            } catch (error) {
+                this.errorHandler.handleDOMError(error, 'button creation');
+                return null;
+            }
+        }
+
+        // Position button relative to input element
+        positionButton(button, inputElement) {
+            const updatePosition = () => {
+                try {
+                    const inputRect = inputElement.getBoundingClientRect();
+                    const scrollX = window.pageXOffset || document.documentElement.scrollLeft;
+                    const scrollY = window.pageYOffset || document.documentElement.scrollTop;
+
+                    // Position in upper-left corner of input with offset
+                    const left = inputRect.left + scrollX + this.buttonConfig.offset.x;
+                    const top = inputRect.top + scrollY + this.buttonConfig.offset.y;
+
+                    button.style.left = `${left}px`;
+                    button.style.top = `${top}px`;
+
+                } catch (error) {
+                    this.errorHandler.handleDOMError(error, 'button positioning');
+                }
+            };
+
+            // Initial positioning
+            updatePosition();
+
+            // Update position on scroll and resize
+            const updatePositionThrottled = EZPrompt.utils.throttle(updatePosition, 16); // ~60fps
+
+            window.addEventListener('scroll', updatePositionThrottled, { passive: true });
+            window.addEventListener('resize', updatePositionThrottled, { passive: true });
+
+            // Store cleanup function
+            button._positionCleanup = () => {
+                window.removeEventListener('scroll', updatePositionThrottled);
+                window.removeEventListener('resize', updatePositionThrottled);
+            };
+
+            return updatePosition;
+        }
+
+        // Attach event listeners to button
+        attachButtonEvents(button, inputElement) {
+            // Click handler
+            const handleClick = (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+
+                this.logger.debug('Prompt button clicked');
+                this.handleButtonClick(inputElement, button);
+            };
+
+            // Keyboard handler
+            const handleKeydown = (event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.handleButtonClick(inputElement, button);
+                }
+            };
+
+            // Mouse events for visual feedback
+            const handleMouseEnter = () => {
+                button.style.opacity = '1';
+            };
+
+            const handleMouseLeave = () => {
+                button.style.opacity = '0.9';
+            };
+
+            // Attach listeners
+            button.addEventListener('click', handleClick);
+            button.addEventListener('keydown', handleKeydown);
+            button.addEventListener('mouseenter', handleMouseEnter);
+            button.addEventListener('mouseleave', handleMouseLeave);
+
+            // Store cleanup function
+            button._eventCleanup = () => {
+                button.removeEventListener('click', handleClick);
+                button.removeEventListener('keydown', handleKeydown);
+                button.removeEventListener('mouseenter', handleMouseEnter);
+                button.removeEventListener('mouseleave', handleMouseLeave);
+            };
+        }
+
+        // Handle button click event
+        handleButtonClick(inputElement, button) {
+            try {
+                this.currentInputElement = inputElement;
+
+                // Add visual feedback
+                button.style.transform = 'translateY(0) scale(0.95)';
+                setTimeout(() => {
+                    button.style.transform = '';
+                }, 150);
+
+                // Calculate position for panel
+                const buttonRect = button.getBoundingClientRect();
+                const position = {
+                    x: buttonRect.left,
+                    y: buttonRect.bottom + 8,
+                    relativeTo: button
+                };
+
+                // Show prompt panel
+                this.showPromptPanel(position);
+
+                // Emit custom event for other components to listen
+                const customEvent = new CustomEvent('ezprompt:button-clicked', {
+                    detail: { inputElement, button }
+                });
+                document.dispatchEvent(customEvent);
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Button click handling');
+            }
+        }
+
+        // Remove button for specific input element
+        removeInputButton(inputElement) {
+            const button = this.activeButtons.get(inputElement);
+            if (!button) {
+                return false;
+            }
+
+            try {
+                // Cleanup event listeners
+                if (button._eventCleanup) {
+                    button._eventCleanup();
+                }
+
+                // Cleanup position listeners
+                if (button._positionCleanup) {
+                    button._positionCleanup();
+                }
+
+                // Remove from DOM
+                if (button.parentNode) {
+                    button.parentNode.removeChild(button);
+                }
+
+                // Remove from tracking
+                this.activeButtons.delete(inputElement);
+
+                this.logger.debug('Input button removed');
+                return true;
+
+            } catch (error) {
+                this.errorHandler.handleDOMError(error, 'button removal');
+                return false;
+            }
+        }
+
+        // Show/hide button based on input focus state
+        setButtonVisibility(inputElement, visible) {
+            const button = this.activeButtons.get(inputElement);
+            if (!button) {
+                return;
+            }
+
+            if (visible) {
+                button.classList.remove('hidden');
+            } else {
+                button.classList.add('hidden');
+            }
+        }
+
+        // Get button for input element
+        getInputButton(inputElement) {
+            return this.activeButtons.get(inputElement) || null;
+        }
+
+        // Check if button exists for input element
+        hasInputButton(inputElement) {
+            return this.activeButtons.has(inputElement);
+        }
+
+        // Get all active buttons
+        getAllButtons() {
+            return Array.from(this.activeButtons.values());
+        }
+
+        // Create autocomplete panel
+        createAutocompletePanel(matches, position) {
+            try {
+                const panel = document.createElement('div');
+                panel.className = this.autocompleteConfig.className;
+
+                // Position panel
+                if (position) {
+                    panel.style.left = position.x + 'px';
+                    panel.style.top = position.y + 'px';
+                }
+
+                // Limit matches to max items
+                const limitedMatches = matches.slice(0, this.autocompleteConfig.maxItems);
+
+                // Create items
+                limitedMatches.forEach((match, index) => {
+                    const item = this.createAutocompleteItem(match, index);
+                    panel.appendChild(item);
+                });
+
+                // Show panel with animation
+                setTimeout(() => {
+                    panel.classList.add('visible');
+                }, 10);
+
+                this.logger.debug('Autocomplete panel created with', limitedMatches.length, 'items');
+                return panel;
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Autocomplete panel creation');
+                return null;
+            }
+        }
+
+        // Create autocomplete item
+        createAutocompleteItem(prompt, index) {
+            const item = document.createElement('div');
+            item.className = 'ezprompt-autocomplete-item';
+            item.dataset.index = index;
+            item.dataset.promptId = prompt.id;
+
+            // Create name element
+            const nameEl = document.createElement('div');
+            nameEl.className = 'ezprompt-autocomplete-item-name';
+            nameEl.textContent = prompt.name;
+
+            // Create content preview
+            const contentEl = document.createElement('div');
+            contentEl.className = 'ezprompt-autocomplete-item-content';
+            contentEl.textContent = prompt.content;
+
+            // Create category element
+            const categoryEl = document.createElement('div');
+            categoryEl.className = 'ezprompt-autocomplete-item-category';
+            categoryEl.textContent = prompt.category || 'General';
+
+            item.appendChild(nameEl);
+            item.appendChild(contentEl);
+            item.appendChild(categoryEl);
+
+            // Add click handler
+            item.addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                this.selectAutocompleteItem(index);
+            });
+
+            return item;
+        }
+
+        // Update autocomplete selection
+        updateSelection() {
+            if (!this.autocompletePanel) return;
+
+            const items = this.autocompletePanel.querySelectorAll('.ezprompt-autocomplete-item');
+            items.forEach((item, index) => {
+                if (index === this.selectedIndex) {
+                    item.classList.add('selected');
+                } else {
+                    item.classList.remove('selected');
+                }
+            });
+        }
+
+        // Navigate autocomplete selection
+        navigateAutocomplete(direction) {
+            if (!this.autocompletePanel) return false;
+
+            const items = this.autocompletePanel.querySelectorAll('.ezprompt-autocomplete-item');
+            if (items.length === 0) return false;
+
+            if (direction === 'up') {
+                this.selectedIndex = this.selectedIndex <= 0 ? items.length - 1 : this.selectedIndex - 1;
+            } else if (direction === 'down') {
+                this.selectedIndex = this.selectedIndex >= items.length - 1 ? 0 : this.selectedIndex + 1;
+            }
+
+            this.updateSelection();
+            return true;
+        }
+
+        // Select autocomplete item
+        selectAutocompleteItem(index = null) {
+            if (!this.autocompletePanel) return null;
+
+            const targetIndex = index !== null ? index : this.selectedIndex;
+            const items = this.autocompletePanel.querySelectorAll('.ezprompt-autocomplete-item');
+
+            if (targetIndex >= 0 && targetIndex < items.length) {
+                const selectedItem = items[targetIndex];
+                const promptId = selectedItem.dataset.promptId;
+
+                // Emit selection event
+                const event = new CustomEvent('ezprompt:autocomplete-select', {
+                    detail: { promptId, index: targetIndex }
+                });
+                document.dispatchEvent(event);
+
+                this.hideAutocomplete();
+                return promptId;
+            }
+
+            return null;
+        }
+
+        // Update button position for all active buttons
+        updateAllButtonPositions() {
+            for (const [inputElement, button] of this.activeButtons) {
+                this.positionButton(button, inputElement);
+            }
+        }
+
+        // Create prompt selection panel
+        createPromptPanel() {
+            const panel = document.createElement('div');
+            panel.className = this.panelConfig.className;
+            panel.setAttribute('role', 'dialog');
+            panel.setAttribute('aria-label', 'Prompt Selection Panel');
+
+            // Build categories HTML
+            const categoriesHtml = this.buildCategoriesHtml();
+
+            panel.innerHTML = `
+                <div class="ezprompt-panel-header">
+                    <input type="text" class="ezprompt-search-input" placeholder="${this.t('panel.search')}" aria-label="Search prompts">
+                    <button class="ezprompt-settings-btn" aria-label="${this.t('button.settings')}" title="${this.t('button.settings')}" style="width: 32px; height: 32px; border: none; background: rgba(107, 114, 128, 0.1); color: #6b7280; border-radius: 6px; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; margin-right: 8px; transition: all 0.2s ease;">⚙️</button>
+                    <button class="ezprompt-close-btn" aria-label="Close panel" title="Close (ESC)">×</button>
+                </div>
+                <div class="ezprompt-panel-content">
+                    <div class="ezprompt-categories">
+                        <div class="ezprompt-category-header">Categories</div>
+                        <div class="ezprompt-category-list">
+                            ${categoriesHtml}
+                        </div>
+                    </div>
+                    <div class="ezprompt-prompts">
+                        <div class="ezprompt-prompts-header">
+                            <span class="ezprompt-prompts-count">0 prompts</span>
+                        </div>
+                        <div class="ezprompt-prompts-list">
+                            <div class="ezprompt-no-prompts">No prompts found. Create your first prompt!</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            document.body.appendChild(panel);
+
+            // Load initial prompts
+            this.filterPromptsByCategory('all');
+
+            return panel;
+        }
+
+        // Build categories HTML from storage
+        buildCategoriesHtml() {
+            let categoriesHtml = '<div class="ezprompt-category-item active" data-category="all">All Prompts</div>';
+
+            if (!this.storage) {
+                categoriesHtml += '<div class="ezprompt-category-item" data-category="default">Default</div>';
+                return categoriesHtml;
+            }
+
+            try {
+                // Get categories from storage
+                const categories = this.storage.getAllCategories ?
+                    Object.values(this.storage.getAllCategories()) :
+                    (this.storage.categories || [{ id: 'default', name: 'Default' }]);
+
+                // Add category items
+                categories.forEach(category => {
+                    categoriesHtml += `<div class="ezprompt-category-item" data-category="${this.escapeHtml(category.id)}">${this.escapeHtml(category.name)}</div>`;
+                });
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Build categories HTML');
+                categoriesHtml += '<div class="ezprompt-category-item" data-category="default">Default</div>';
+            }
+
+            return categoriesHtml;
+        }
+
+        // Position prompt panel relative to button or input
+        positionPromptPanel(position) {
+            if (!this.promptPanel || !position) {
+                return;
+            }
+
+            const panel = this.promptPanel;
+            const viewport = {
+                width: window.innerWidth,
+                height: window.innerHeight
+            };
+
+            // Set initial position
+            panel.style.left = `${position.x}px`;
+            panel.style.top = `${position.y}px`;
+
+            // Get panel dimensions after positioning
+            const panelRect = panel.getBoundingClientRect();
+
+            // Adjust horizontal position if panel goes off-screen
+            let adjustedX = position.x;
+            if (panelRect.right > viewport.width - 20) {
+                adjustedX = viewport.width - panelRect.width - 20;
+            }
+            if (adjustedX < 20) {
+                adjustedX = 20;
+            }
+
+            // Adjust vertical position if panel goes off-screen
+            let adjustedY = position.y;
+            if (panelRect.bottom > viewport.height - 20) {
+                // Position above the button instead
+                adjustedY = position.y - panelRect.height - 40;
+            }
+            if (adjustedY < 20) {
+                adjustedY = 20;
+            }
+
+            // Apply adjusted position
+            panel.style.left = `${adjustedX}px`;
+            panel.style.top = `${adjustedY}px`;
+        }
+
+        // Setup event listeners for prompt panel
+        setupPromptPanelEvents() {
+            if (!this.promptPanel) {
+                return;
+            }
+
+            const panel = this.promptPanel;
+
+            // Close button
+            const closeBtn = panel.querySelector('.ezprompt-close-btn');
+            if (closeBtn) {
+                closeBtn.addEventListener('click', () => this.hidePromptPanel());
+            }
+
+            // Settings button
+            const settingsBtn = panel.querySelector('.ezprompt-settings-btn');
+            if (settingsBtn) {
+                settingsBtn.addEventListener('click', () => {
+                    this.hidePromptPanel();
+                    setTimeout(() => this.showSettingsPanel(), 100);
+                });
+
+                // Add hover effect
+                settingsBtn.addEventListener('mouseenter', () => {
+                    settingsBtn.style.background = 'rgba(79, 70, 229, 0.1)';
+                    settingsBtn.style.color = '#4f46e5';
+                });
+                settingsBtn.addEventListener('mouseleave', () => {
+                    settingsBtn.style.background = 'rgba(107, 114, 128, 0.1)';
+                    settingsBtn.style.color = '#6b7280';
+                });
+            }
+
+            // Search input
+            const searchInput = panel.querySelector('.ezprompt-search-input');
+            if (searchInput) {
+                searchInput.addEventListener('input', EZPrompt.utils.debounce((e) => {
+                    this.filterPrompts(e.target.value);
+                }, 300));
+            }
+
+            // Category selection
+            const categoryItems = panel.querySelectorAll('.ezprompt-category-item');
+            categoryItems.forEach(item => {
+                item.addEventListener('click', () => {
+                    // Remove active class from all categories
+                    categoryItems.forEach(cat => cat.classList.remove('active'));
+                    // Add active class to clicked category
+                    item.classList.add('active');
+                    // Filter prompts by category
+                    this.filterPromptsByCategory(item.dataset.category);
+                });
+            });
+
+            // ESC key handling
+            this.panelKeyHandler = (e) => {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    this.hidePromptPanel();
+                }
+            };
+            document.addEventListener('keydown', this.panelKeyHandler);
+
+            // Click outside to close
+            this.panelClickHandler = (e) => {
+                if (!panel.contains(e.target) && !this.isClickOnButton(e.target)) {
+                    this.hidePromptPanel();
+                }
+            };
+            document.addEventListener('click', this.panelClickHandler);
+        }
+
+        // Cleanup event listeners for prompt panel
+        cleanupPromptPanelEvents() {
+            if (this.panelKeyHandler) {
+                document.removeEventListener('keydown', this.panelKeyHandler);
+                this.panelKeyHandler = null;
+            }
+
+            if (this.panelClickHandler) {
+                document.removeEventListener('click', this.panelClickHandler);
+                this.panelClickHandler = null;
+            }
+        }
+
+        // Check if click target is on a prompt button
+        isClickOnButton(target) {
+            return target.closest('.ezprompt-button') !== null;
+        }
+
+        // Create settings panel
+        createSettingsPanel() {
+            const panel = document.createElement('div');
+            panel.className = 'ezprompt-settings-panel';
+            panel.setAttribute('role', 'dialog');
+            panel.setAttribute('aria-label', this.t('settings.title'));
+
+            // Get current configuration
+            const config = this.storage ? this.storage.getUserConfig() : null;
+            const currentTheme = config?.ui_theme || 'auto';
+            const currentLanguage = config?.language || 'en';
+            const currentInsertionMode = config?.insertion_mode || 'replace';
+
+            // Get statistics
+            const stats = this.getUsageStatistics();
+            const popularPrompts = this.getPopularPrompts();
+
+            panel.innerHTML = `
+                <div class="ezprompt-settings-header">
+                    <h2 class="ezprompt-settings-title">${this.t('settings.title')}</h2>
+                    <button class="ezprompt-close-btn" aria-label="Close panel" title="Close (ESC)">×</button>
+                </div>
+                <div class="ezprompt-settings-content">
+                    <!-- Theme Settings -->
+                    <div class="ezprompt-settings-section">
+                        <div class="ezprompt-settings-section-title">🎨 ${this.t('settings.theme')}</div>
+                        <div class="ezprompt-settings-row">
+                            <label class="ezprompt-settings-label">${this.t('settings.theme')}</label>
+                            <select class="ezprompt-settings-select" data-setting="theme">
+                                <option value="light" ${currentTheme === 'light' ? 'selected' : ''}>${this.t('settings.theme.light')}</option>
+                                <option value="dark" ${currentTheme === 'dark' ? 'selected' : ''}>${this.t('settings.theme.dark')}</option>
+                                <option value="auto" ${currentTheme === 'auto' ? 'selected' : ''}>${this.t('settings.theme.auto')}</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Language Settings -->
+                    <div class="ezprompt-settings-section">
+                        <div class="ezprompt-settings-section-title">🌐 ${this.t('settings.language')}</div>
+                        <div class="ezprompt-settings-row">
+                            <label class="ezprompt-settings-label">${this.t('settings.language')}</label>
+                            <select class="ezprompt-settings-select" data-setting="language">
+                                <option value="en" ${currentLanguage === 'en' ? 'selected' : ''}>${this.t('settings.language.en')}</option>
+                                <option value="zh" ${currentLanguage === 'zh' ? 'selected' : ''}>${this.t('settings.language.zh')}</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Insertion Mode Settings -->
+                    <div class="ezprompt-settings-section">
+                        <div class="ezprompt-settings-section-title">📝 ${this.t('settings.insertion_mode')}</div>
+                        <div class="ezprompt-settings-row">
+                            <label class="ezprompt-settings-label">${this.t('settings.insertion_mode')}</label>
+                            <select class="ezprompt-settings-select" data-setting="insertion_mode">
+                                <option value="replace" ${currentInsertionMode === 'replace' ? 'selected' : ''}>${this.t('settings.insertion_mode.replace')}</option>
+                                <option value="prefix" ${currentInsertionMode === 'prefix' ? 'selected' : ''}>${this.t('settings.insertion_mode.prefix')}</option>
+                                <option value="suffix" ${currentInsertionMode === 'suffix' ? 'selected' : ''}>${this.t('settings.insertion_mode.suffix')}</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Usage Statistics -->
+                    <div class="ezprompt-settings-section">
+                        <div class="ezprompt-settings-section-title">📊 ${this.t('settings.statistics')}</div>
+                        <div class="ezprompt-stats-grid">
+                            <div class="ezprompt-stat-card">
+                                <div class="ezprompt-stat-value">${stats.totalInsertions}</div>
+                                <div class="ezprompt-stat-label">${this.t('stats.total_insertions')}</div>
+                            </div>
+                            <div class="ezprompt-stat-card">
+                                <div class="ezprompt-stat-value">${stats.sessionInsertions}</div>
+                                <div class="ezprompt-stat-label">${this.t('stats.session_insertions')}</div>
+                            </div>
+                            <div class="ezprompt-stat-card">
+                                <div class="ezprompt-stat-value">${stats.sessionTime}</div>
+                                <div class="ezprompt-stat-label">${this.t('stats.session_time')}</div>
+                            </div>
+                            <div class="ezprompt-stat-card">
+                                <div class="ezprompt-stat-value">${stats.mostUsedPrompt || 'N/A'}</div>
+                                <div class="ezprompt-stat-label">${this.t('stats.most_used')}</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Popular Prompts -->
+                    <div class="ezprompt-settings-section">
+                        <div class="ezprompt-settings-section-title">🔥 ${this.t('settings.popular_prompts')}</div>
+                        <div class="ezprompt-popular-list">
+                            ${popularPrompts.map(prompt => `
+                                <div class="ezprompt-popular-item">
+                                    <span class="ezprompt-popular-name">${this.escapeHtml(prompt.name)}</span>
+                                    <span class="ezprompt-popular-count">${prompt.usage_count || 0}</span>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+
+                    <!-- Batch Operations -->
+                    <div class="ezprompt-settings-section">
+                        <div class="ezprompt-settings-section-title">⚡ ${this.t('settings.batch_operations')}</div>
+                        <div class="ezprompt-batch-controls">
+                            <button class="ezprompt-batch-btn" data-action="export-all">${this.t('settings.export_all')}</button>
+                                <button class="ezprompt-batch-btn" data-action="export-csv">${this.t('settings.export_csv')}</button>
+                            <button class="ezprompt-batch-btn" data-action="import-data">${this.t('settings.import_data')}</button>
+                                <button class="ezprompt-batch-btn" data-action="open-custom-site-selector">${this.t('settings.custom_site_tool')}</button>
+                            <button class="ezprompt-batch-btn danger" data-action="clear-stats">${this.t('settings.clear_stats')}</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+
+            document.body.appendChild(panel);
+            return panel;
+        }
+
+        // Position settings panel in center of screen
+        positionSettingsPanel() {
+            if (!this.settingsPanel) {
+                return;
+            }
+
+            const panel = this.settingsPanel;
+            const viewport = {
+                width: window.innerWidth,
+                height: window.innerHeight
+            };
+
+            // Center the panel
+            const panelRect = panel.getBoundingClientRect();
+            const x = Math.max(20, (viewport.width - panelRect.width) / 2);
+            const y = Math.max(20, (viewport.height - panelRect.height) / 2);
+
+            panel.style.left = `${x}px`;
+            panel.style.top = `${y}px`;
+        }
+
+        // Setup event listeners for settings panel
+        setupSettingsPanelEvents() {
+            if (!this.settingsPanel) {
+                return;
+            }
+
+            const panel = this.settingsPanel;
+
+            // Close button
+            const closeBtn = panel.querySelector('.ezprompt-close-btn');
+            if (closeBtn) {
+                closeBtn.addEventListener('click', () => this.hideSettingsPanel());
+            }
+
+            // Settings selects
+            const settingsSelects = panel.querySelectorAll('.ezprompt-settings-select');
+            settingsSelects.forEach(select => {
+                select.addEventListener('change', (e) => {
+                    this.handleSettingChange(e.target.dataset.setting, e.target.value);
+                });
+            });
+
+            // Batch operation buttons
+            const batchButtons = panel.querySelectorAll('.ezprompt-batch-btn');
+            batchButtons.forEach(button => {
+                button.addEventListener('click', (e) => {
+                    this.handleBatchOperation(e.target.dataset.action);
+                });
+            });
+
+            // ESC key handling
+            this.settingsKeyHandler = (e) => {
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    this.hideSettingsPanel();
+                }
+            };
+            document.addEventListener('keydown', this.settingsKeyHandler);
+
+            // Click outside to close
+            this.settingsClickHandler = (e) => {
+                if (!panel.contains(e.target)) {
+                    this.hideSettingsPanel();
+                }
+            };
+            document.addEventListener('click', this.settingsClickHandler);
+        }
+
+        // Cleanup event listeners for settings panel
+        cleanupSettingsPanelEvents() {
+            if (this.settingsKeyHandler) {
+                document.removeEventListener('keydown', this.settingsKeyHandler);
+                this.settingsKeyHandler = null;
+            }
+
+            if (this.settingsClickHandler) {
+                document.removeEventListener('click', this.settingsClickHandler);
+                this.settingsClickHandler = null;
+            }
+        }
+
+        // Handle setting changes
+        handleSettingChange(setting, value) {
+            try {
+                if (!this.storage) {
+                    this.errorHandler.handleStorageError(
+                        new Error('Storage not available'),
+                        'setting change'
+                    );
+                    return;
+                }
+
+                // Validate setting value
+                const validationResult = this.validateSettingValue(setting, value);
+                if (!validationResult.valid) {
+                    this.showValidationFeedback(setting, validationResult.message, 'error');
+                    return;
+                }
+
+                const updates = {};
+                const normalizedValue = validationResult.value;
+
+                switch (setting) {
+                    case 'theme':
+                        updates.ui_theme = normalizedValue;
+                        this.applyTheme(normalizedValue);
+                        break;
+                    case 'language':
+                        updates.language = normalizedValue;
+                        this.setLanguage(normalizedValue);
+                        break;
+                    case 'insertion_mode':
+                        updates.insertion_mode = normalizedValue;
+                        break;
+                    case 'auto_sync':
+                        updates.auto_sync = normalizedValue;
+                        this.handleAutoSyncChange(normalizedValue);
+                        break;
+                    case 'sync_interval':
+                        updates.sync_interval = normalizedValue;
+                        break;
+                    default:
+                        updates[setting] = normalizedValue;
+                        break;
+                }
+
+                // Update storage
+                this.storage.updateUserConfig(updates);
+                this.logger.info(`Setting ${setting} updated to: ${normalizedValue}`);
+
+                // Show success notification with specific feedback
+                this.showNotification(
+                    this.getSettingChangeMessage(setting, normalizedValue),
+                    'success'
+                );
+
+            } catch (error) {
+                this.errorHandler.handleConfigurationError(error, { setting, value });
+                this.showNotification(`Failed to save ${setting} setting`, 'error');
+            }
+        }
+
+        // Validate setting values with detailed feedback
+        validateSettingValue(setting, value) {
+            try {
+                switch (setting) {
+                    case 'insertion_mode':
+                        const validModes = ['replace', 'prefix', 'suffix'];
+                        if (!validModes.includes(value)) {
+                            return {
+                                valid: false,
+                                message: `Must be one of: ${validModes.join(', ')}`
+                            };
+                        }
+                        return { valid: true, value };
+
+                    case 'theme':
+                    case 'ui_theme':
+                        const validThemes = ['light', 'dark', 'auto'];
+                        if (!validThemes.includes(value)) {
+                            return {
+                                valid: false,
+                                message: `Must be one of: ${validThemes.join(', ')}`
+                            };
+                        }
+                        return { valid: true, value };
+
+                    case 'language':
+                        const validLanguages = ['en', 'zh'];
+                        if (!validLanguages.includes(value)) {
+                            return {
+                                valid: false,
+                                message: `Must be one of: ${validLanguages.join(', ')}`
+                            };
+                        }
+                        return { valid: true, value };
+
+                    case 'auto_sync':
+                        const boolValue = value === 'true' || value === true;
+                        return { valid: true, value: boolValue };
+
+                    case 'sync_interval':
+                        const interval = parseInt(value);
+                        if (isNaN(interval) || interval < 60) {
+                            return {
+                                valid: false,
+                                message: 'Must be a number >= 60 seconds'
+                            };
+                        }
+                        return { valid: true, value: interval };
+
+                    default:
+                        // For unknown settings, just validate it's not null/undefined
+                        if (value === null || value === undefined) {
+                            return {
+                                valid: false,
+                                message: 'Value cannot be empty'
+                            };
+                        }
+                        return { valid: true, value };
+                }
+            } catch (error) {
+                this.errorHandler.handleValidationError(error, setting, value);
+                return {
+                    valid: false,
+                    message: 'Validation error occurred'
+                };
+            }
+        }
+
+        // Get user-friendly setting change messages
+        getSettingChangeMessage(setting, value) {
+            const messages = {
+                'insertion_mode': `Insertion mode set to ${value}`,
+                'theme': `Theme changed to ${value}`,
+                'ui_theme': `Theme changed to ${value}`,
+                'language': `Language changed to ${value}`,
+                'auto_sync': value ? 'Auto-sync enabled' : 'Auto-sync disabled',
+                'sync_interval': `Sync interval set to ${value} seconds`
+            };
+
+            return messages[setting] || `${setting} updated successfully`;
+        }
+
+        // Handle auto-sync setting changes
+        handleAutoSyncChange(enabled) {
+            try {
+                const syncManager = EZPrompt.modules.syncManager;
+                if (!syncManager) return;
+
+                if (enabled) {
+                    const config = this.storage.getUserConfig();
+                    if (config && config.webdav_config) {
+                        syncManager.startAutoSync();
+                        this.showNotification('Auto-sync started', 'info');
+                    } else {
+                        this.showNotification('Please configure WebDAV settings first', 'warning');
+                    }
+                } else {
+                    syncManager.stopAutoSync();
+                    this.showNotification('Auto-sync stopped', 'info');
+                }
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Auto-sync change', { enabled });
+            }
+        }
+
+        // Handle batch operations
+        handleBatchOperation(action) {
+            try {
+                switch (action) {
+                    case 'export-all':
+                        this.exportAllData();
+                        break;
+                    case 'export-csv':
+                        this.exportToCSV();
+                        break;
+                    case 'import-data':
+                        this.importData();
+                        break;
+                    case 'clear-stats':
+                        this.clearStatistics();
+                        break;
+                    case 'open-custom-site-selector':
+                        this.openCustomSiteSelector();
+                        break;
+                }
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Handle batch operation');
+            }
+        }
+
+        // Export prompts to CSV (basic)
+        exportToCSV() {
+            try {
+                if (!this.storage) throw new Error('Storage not available');
+                const prompts = this.storage.getAllPrompts();
+                const rows = [
+                    ['id', 'name', 'content', 'category', 'tags', 'usage_count', 'created_at', 'updated_at']
+                ];
+                for (const p of Object.values(prompts)) {
+                    if (!p) continue;
+                    rows.push([
+                        p.id,
+                        p.name.replace(/\n/g, ' '),
+                        (p.content || '').replace(/\n/g, '\\n'),
+                        p.category || '',
+                        (p.tags || []).join('|'),
+                        String(p.usage_count || 0),
+                        p.created_at || '',
+                        p.updated_at || ''
+                    ]);
+                }
+                const csv = rows.map(r => r.map(v => '"' + (String(v).replace(/"/g, '""')) + '"').join(',')).join('\n');
+                const blob = new Blob([csv], { type: 'text/csv' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `ezprompt-export-${new Date().toISOString().split('T')[0]}.csv`;
+                document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+                this.showNotification(this.t('success.csv_exported'), 'success');
+            } catch (e) {
+                this.errorHandler.handleExportError(e, 'csv');
+                this.showNotification(this.t('error.export_failed'), 'error');
+            }
+        }
+
+        // Visual custom site selector
+        openCustomSiteSelector() {
+            try {
+                if (document.getElementById('ezprompt-custom-site-overlay')) return;
+                const overlay = document.createElement('div');
+                overlay.id = 'ezprompt-custom-site-overlay';
+                Object.assign(overlay.style, {
+                    position: 'fixed', left: '0', top: '0', width: '100%', height: '100%', zIndex: 100000, background: 'rgba(0,0,0,0.15)', cursor: 'crosshair'
+                });
+                const hint = document.createElement('div');
+                hint.textContent = this.t('custom_site.selector.hint');
+                Object.assign(hint.style, { position: 'fixed', top: '12px', left: '50%', transform: 'translateX(-50%)', background: '#111', color: '#fff', padding: '6px 12px', borderRadius: '6px', fontSize: '12px', fontFamily: 'sans-serif', zIndex: 100001 });
+                const highlight = document.createElement('div');
+                Object.assign(highlight.style, { position: 'absolute', pointerEvents: 'none', border: '2px solid #6366f1', background: 'rgba(99,102,241,0.15)', zIndex: 100002 });
+                document.body.appendChild(overlay); document.body.appendChild(hint); document.body.appendChild(highlight);
+                const moveHandler = (e) => {
+                    const el = document.elementFromPoint(e.clientX, e.clientY);
+                    if (!el || el === overlay || el === highlight) return;
+                    const rect = el.getBoundingClientRect();
+                    highlight.style.left = rect.left + 'px';
+                    highlight.style.top = rect.top + 'px';
+                    highlight.style.width = rect.width + 'px';
+                    highlight.style.height = rect.height + 'px';
+                };
+                overlay.addEventListener('mousemove', moveHandler);
+                const cancel = () => { overlay.remove(); highlight.remove(); hint.remove(); document.removeEventListener('keydown', escHandler); };
+                const escHandler = (e) => { if (e.key === 'Escape') { cancel(); } };
+                document.addEventListener('keydown', escHandler);
+                overlay.addEventListener('click', (e) => {
+                    const el = document.elementFromPoint(e.clientX, e.clientY);
+                    if (!el || el === overlay) return;
+                    e.preventDefault();
+                    const selector = this.buildElementSelector(el);
+                    cancel();
+                    this.showCustomSiteDialog(selector);
+                });
+            } catch (err) {
+                this.errorHandler.handleError(err, 'custom site selector');
+            }
+        }
+
+        buildElementSelector(el) {
+            if (!el) return '';
+            if (el.id) return `#${el.id}`;
+            const parts = []; let cur = el; let depth = 0;
+            while (cur && cur.nodeType === 1 && depth < 5 && cur !== document.body) {
+                let part = cur.tagName.toLowerCase();
+                if (cur.className && typeof cur.className === 'string') {
+                    const cls = cur.className.trim().split(/\s+/).slice(0, 2).join('.');
+                    // Sanitize class fragment: allow letters, digits, underscore, dash, dot
+                    if (cls) part += '.' + cls.replace(/[^a-zA-Z0-9_.-]/g, '');
+                }
+                parts.unshift(part); depth++; cur = cur.parentElement;
+            }
+            return parts.join(' > ');
+        }
+
+        showCustomSiteDialog(inputSelector) {
+            const dlg = document.createElement('div');
+            Object.assign(dlg.style, { position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%,-50%)', background: '#fff', color: '#111', padding: '16px', zIndex: 100003, border: '1px solid #ddd', borderRadius: '8px', width: '360px', fontFamily: 'sans-serif', boxShadow: '0 8px 24px rgba(0,0,0,0.15)' });
+            dlg.innerHTML = `<h3 style="margin:0 0 12px;font-size:16px;">${this.t('custom_site.selector.title')}</h3>
+                <label style='display:block;font-size:12px;margin-bottom:4px;'>${this.t('custom_site.selector.site_id')}</label>
+                <input id='ezp-site-id' style='width:100%;margin-bottom:8px;' />
+                <label style='display:block;font-size:12px;margin-bottom:4px;'>${this.t('custom_site.selector.site_name')}</label>
+                <input id='ezp-site-name' style='width:100%;margin-bottom:8px;' />
+                <label style='display:block;font-size:12px;margin-bottom:4px;'>${this.t('custom_site.selector.domain')}</label>
+                <input id='ezp-site-domains' placeholder='example.com, sub.site.com' style='width:100%;margin-bottom:8px;' />
+                <label style='display:block;font-size:12px;margin-bottom:4px;'>Input Selector</label>
+                <input id='ezp-site-selector' value='${this.escapeHtml(inputSelector)}' style='width:100%;margin-bottom:12px;' />
+                <div style='display:flex;gap:8px;justify-content:flex-end;'>
+                    <button id='ezp-site-cancel'>${this.t('custom_site.selector.cancel')}</button>
+                    <button id='ezp-site-save' style='background:#4f46e5;color:#fff;border:none;padding:4px 12px;border-radius:4px;'>${this.t('custom_site.selector.save')}</button>
+                </div>`;
+            document.body.appendChild(dlg);
+            const close = () => { dlg.remove(); };
+            dlg.querySelector('#ezp-site-cancel').onclick = close;
+            dlg.querySelector('#ezp-site-save').onclick = () => {
+                try {
+                    const id = dlg.querySelector('#ezp-site-id').value.trim();
+                    const name = dlg.querySelector('#ezp-site-name').value.trim();
+                    const domains = dlg.querySelector('#ezp-site-domains').value.split(',').map(d => d.trim()).filter(Boolean);
+                    const selector = dlg.querySelector('#ezp-site-selector').value.trim();
+                    if (!id || !name || !domains.length || !selector) throw new Error('Missing fields');
+                    EZPrompt.modules.siteDetection.registerCustomSite({ id, name, domains, inputSelectors: [selector] });
+                    this.showNotification('Custom site saved', 'success');
+                } catch (e) { this.errorHandler.handleValidationError(e, 'custom site'); this.showNotification('Failed', 'error'); }
+                close();
+            };
+        }
+
+        // Get usage statistics
+        getUsageStatistics() {
+            const sessionTime = Math.floor((Date.now() - this.statisticsData.sessionStart) / 1000 / 60); // minutes
+
+            let totalInsertions = 0;
+            let mostUsedPrompt = null;
+            let maxUsage = 0;
+
+            if (this.storage) {
+                try {
+                    const prompts = this.storage.getAllPrompts();
+                    if (prompts) {
+                        Object.values(prompts).forEach(prompt => {
+                            const usage = prompt.usage_count || 0;
+                            totalInsertions += usage;
+                            if (usage > maxUsage) {
+                                maxUsage = usage;
+                                mostUsedPrompt = prompt.name;
+                            }
+                        });
+                    }
+                } catch (error) {
+                    this.errorHandler.handleError(error, 'Get usage statistics');
+                }
+            }
+
+            return {
+                totalInsertions,
+                sessionInsertions: this.statisticsData.sessionInsertions,
+                sessionTime: `${sessionTime}m`,
+                mostUsedPrompt
+            };
+        }
+
+        // Get popular prompts
+        getPopularPrompts(limit = 5) {
+            if (!this.storage) {
+                return [];
+            }
+
+            try {
+                const prompts = this.storage.getAllPrompts();
+                if (!prompts) {
+                    return [];
+                }
+
+                return Object.values(prompts)
+                    .filter(prompt => prompt && (prompt.usage_count || 0) > 0)
+                    .sort((a, b) => (b.usage_count || 0) - (a.usage_count || 0))
+                    .slice(0, limit);
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Get popular prompts');
+                return [];
+            }
+        }
+
+        // Apply theme
+        applyTheme(theme) {
+            const root = document.documentElement;
+
+            switch (theme) {
+                case 'light':
+                    root.style.colorScheme = 'light';
+                    break;
+                case 'dark':
+                    root.style.colorScheme = 'dark';
+                    break;
+                case 'auto':
+                default:
+                    root.style.colorScheme = 'light dark';
+                    break;
+            }
+
+            this.logger.info(`Theme applied: ${theme}`);
+        }
+
+        // Export all data
+        exportAllData() {
+            try {
+                if (!this.storage) {
+                    throw new Error('Storage not available');
+                }
+
+                const data = this.storage.exportData();
+                const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `ezprompt-export-${new Date().toISOString().split('T')[0]}.json`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+
+                this.showNotification(this.t('success.data_exported'), 'success');
+                this.logger.info('Data exported successfully');
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Export all data');
+                this.showNotification(this.t('error.export_failed'), 'error');
+            }
+        }
+
+        // Enhanced import data with comprehensive validation and feedback
+        importData() {
+            try {
+                const input = document.createElement('input');
+                input.type = 'file';
+                input.accept = '.json,.csv';
+
+                input.onchange = (e) => {
+                    const file = e.target.files[0];
+                    if (!file) return;
+
+                    // Validate file size (max 10MB)
+                    if (file.size > 10 * 1024 * 1024) {
+                        this.showValidationFeedback('File size', 'File too large (max 10MB)', 'error');
+                        return;
+                    }
+
+                    // Show progress notification
+                    const progressNotification = this.showNotification(
+                        `Processing ${file.name}...`,
+                        'info',
+                        { duration: 0, persistent: true }
+                    );
+
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        this.processImportFile(e.target.result, file.name, progressNotification);
+                    };
+
+                    reader.onerror = () => {
+                        this.hideNotification(progressNotification);
+                        this.errorHandler.handleImportError(
+                            new Error('Failed to read file'),
+                            file.name
+                        );
+                    };
+
+                    reader.readAsText(file);
+                };
+
+                input.click();
+
+            } catch (error) {
+                this.errorHandler.handleImportError(error, 'unknown');
+            }
+        }
+
+        // Process import file with detailed validation
+        async processImportFile(content, filename, progressNotification) {
+            try {
+                let data;
+                const fileExtension = filename.split('.').pop().toLowerCase();
+
+                // Parse file based on extension
+                if (fileExtension === 'json') {
+                    data = this.parseJSONImport(content, filename);
+                } else if (fileExtension === 'csv') {
+                    data = this.parseCSVImport(content, filename);
+                } else {
+                    throw new Error(`Unsupported file format: ${fileExtension}`);
+                }
+
+                if (!data) {
+                    throw new Error('Failed to parse file content');
+                }
+
+                // Validate import data structure
+                const validationResult = this.validateImportData(data, filename);
+                if (!validationResult.valid) {
+                    this.hideNotification(progressNotification);
+                    this.showImportValidationErrors(validationResult.errors);
+                    return;
+                }
+
+                // Show import preview and options
+                this.hideNotification(progressNotification);
+                this.showImportPreview(data, filename, validationResult.summary);
+
+            } catch (error) {
+                this.hideNotification(progressNotification);
+                this.errorHandler.handleImportError(error, filename);
+            }
+        }
+
+        // Parse JSON import with validation
+        parseJSONImport(content, filename) {
+            try {
+                const data = JSON.parse(content);
+
+                // Check if it's EZPrompt format
+                if (data.metadata && data.metadata.source === 'EZPrompt') {
+                    return data;
+                }
+
+                // Try to detect other formats and convert
+                if (data.prompts || data.categories) {
+                    return {
+                        metadata: {
+                            source: 'EZPrompt',
+                            version: '1.0.0',
+                            exported: new Date().toISOString(),
+                            imported_from: filename
+                        },
+                        data: {
+                            prompts: data.prompts || {},
+                            categories: data.categories || {},
+                            config: data.config || {}
+                        }
+                    };
+                }
+
+                throw new Error('Unrecognized JSON format');
+
+            } catch (error) {
+                if (error instanceof SyntaxError) {
+                    throw new Error('Invalid JSON format: ' + error.message);
+                }
+                throw error;
+            }
+        }
+
+        // Parse CSV import (basic implementation)
+        parseCSVImport(content, filename) {
+            try {
+                const lines = content.split('\n').filter(line => line.trim());
+                if (lines.length < 2) {
+                    throw new Error('CSV file must have at least a header and one data row');
+                }
+
+                const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+                const requiredHeaders = ['name', 'content'];
+                const missingHeaders = requiredHeaders.filter(h => !headers.includes(h));
+
+                if (missingHeaders.length > 0) {
+                    throw new Error(`Missing required CSV columns: ${missingHeaders.join(', ')}`);
+                }
+
+                const prompts = {};
+                const errors = [];
+
+                for (let i = 1; i < lines.length; i++) {
+                    try {
+                        const values = lines[i].split(',').map(v => v.trim().replace(/^"|"$/g, ''));
+                        const prompt = {};
+
+                        headers.forEach((header, index) => {
+                            prompt[header] = values[index] || '';
+                        });
+
+                        if (!prompt.name || !prompt.content) {
+                            errors.push(`Row ${i + 1}: Missing name or content`);
+                            continue;
+                        }
+
+                        const id = EZPrompt.utils.generateId();
+                        prompts[id] = {
+                            id,
+                            name: prompt.name,
+                            content: prompt.content,
+                            category: prompt.category || 'imported',
+                            tags: prompt.tags ? prompt.tags.split(';') : [],
+                            usage_count: 0,
+                            created_at: new Date().toISOString(),
+                            updated_at: new Date().toISOString()
+                        };
+
+                    } catch (error) {
+                        errors.push(`Row ${i + 1}: ${error.message}`);
+                    }
+                }
+
+                if (Object.keys(prompts).length === 0) {
+                    throw new Error('No valid prompts found in CSV file');
+                }
+
+                return {
+                    metadata: {
+                        source: 'EZPrompt',
+                        version: '1.0.0',
+                        exported: new Date().toISOString(),
+                        imported_from: filename,
+                        import_errors: errors
+                    },
+                    data: {
+                        prompts,
+                        categories: {},
+                        config: {}
+                    }
+                };
+
+            } catch (error) {
+                throw new Error('CSV parsing error: ' + error.message);
+            }
+        }
+
+        // Validate import data with detailed feedback
+        validateImportData(data, filename) {
+            const errors = [];
+            const warnings = [];
+            let promptCount = 0;
+            let categoryCount = 0;
+
+            try {
+                // Validate structure
+                if (!data.data) {
+                    errors.push('Missing data section');
+                    return { valid: false, errors };
+                }
+
+                // Validate prompts
+                if (data.data.prompts) {
+                    const prompts = data.data.prompts;
+                    if (typeof prompts !== 'object') {
+                        errors.push('Prompts section must be an object');
+                    } else {
+                        Object.entries(prompts).forEach(([id, prompt]) => {
+                            try {
+                                EZPrompt.modules.storage?.constructor.validatePrompt?.(prompt);
+                                promptCount++;
+                            } catch (error) {
+                                errors.push(`Invalid prompt ${id}: ${error.message}`);
+                            }
+                        });
+                    }
+                }
+
+                // Validate categories
+                if (data.data.categories) {
+                    const categories = data.data.categories;
+                    if (typeof categories !== 'object') {
+                        errors.push('Categories section must be an object');
+                    } else {
+                        Object.entries(categories).forEach(([id, category]) => {
+                            try {
+                                // Basic category validation
+                                if (!category.name) {
+                                    errors.push(`Category ${id} missing name`);
+                                } else {
+                                    categoryCount++;
+                                }
+                            } catch (error) {
+                                errors.push(`Invalid category ${id}: ${error.message}`);
+                            }
+                        });
+                    }
+                }
+
+                // Check for conflicts with existing data
+                if (this.storage && promptCount > 0) {
+                    const existingPrompts = this.storage.getAllPrompts() || {};
+                    const conflicts = Object.values(data.data.prompts || {}).filter(prompt =>
+                        Object.values(existingPrompts).some(existing => existing.name === prompt.name)
+                    );
+
+                    if (conflicts.length > 0) {
+                        warnings.push(`${conflicts.length} prompts have the same name as existing prompts`);
+                    }
+                }
+
+                return {
+                    valid: errors.length === 0,
+                    errors,
+                    warnings,
+                    summary: {
+                        prompts: promptCount,
+                        categories: categoryCount,
+                        hasConfig: !!data.data.config && Object.keys(data.data.config).length > 0
+                    }
+                };
+
+            } catch (error) {
+                errors.push(`Validation error: ${error.message}`);
+                return { valid: false, errors };
+            }
+        }
+
+        // Show import validation errors
+        showImportValidationErrors(errors) {
+            const errorList = errors.slice(0, 10).map(e => `• ${e}`).join('\n');
+            const moreErrors = errors.length > 10 ? `\n... and ${errors.length - 10} more errors` : '';
+
+            this.showNotification(
+                `Import validation failed:\n${errorList}${moreErrors}`,
+                'error',
+                { persistent: true }
+            );
+        }
+
+        // Show import preview with options
+        showImportPreview(data, filename, summary) {
+            const message = `Import Preview for ${filename}:\n` +
+                `• ${summary.prompts} prompts\n` +
+                `• ${summary.categories} categories\n` +
+                (summary.hasConfig ? '• Configuration settings\n' : '');
+
+            const actions = [
+                {
+                    label: 'Import All',
+                    handler: () => this.executeImport(data, { merge: false })
+                },
+                {
+                    label: 'Merge',
+                    handler: () => this.executeImport(data, { merge: true })
+                },
+                {
+                    label: 'Cancel',
+                    handler: () => { }
+                }
+            ];
+
+            this.showNotification(message, 'info', {
+                persistent: true,
+                actions
+            });
+        }
+
+        // Execute import with feedback
+        async executeImport(data, options) {
+            try {
+                if (!this.storage) {
+                    throw new Error('Storage not available');
+                }
+
+                const progressNotification = this.showNotification(
+                    'Importing data...',
+                    'info',
+                    { duration: 0, persistent: true }
+                );
+
+                const result = this.storage.importData(data, options);
+
+                this.hideNotification(progressNotification);
+                this.showImportFeedback(result);
+
+                // Refresh UI if needed
+                if (this.settingsPanelVisible) {
+                    this.hideSettingsPanel();
+                    setTimeout(() => this.showSettingsPanel(), 100);
+                }
+
+                this.logger.info('Data imported successfully', result);
+
+            } catch (error) {
+                this.errorHandler.handleImportError(error, 'import execution');
+            }
+        }
+
+        // Clear statistics
+        clearStatistics() {
+            try {
+                if (!confirm('Are you sure you want to clear all usage statistics? This cannot be undone.')) {
+                    return;
+                }
+
+                if (this.storage) {
+                    const prompts = this.storage.getAllPrompts();
+                    if (prompts) {
+                        Object.keys(prompts).forEach(id => {
+                            this.storage.updatePrompt(id, { usage_count: 0 });
+                        });
+                    }
+                }
+
+                // Reset session statistics
+                this.statisticsData.totalInsertions = 0;
+                this.statisticsData.sessionInsertions = 0;
+                this.statisticsData.sessionStart = Date.now();
+
+                this.showNotification('Statistics cleared', 'success');
+                this.logger.info('Statistics cleared');
+
+                // Refresh settings panel
+                if (this.settingsPanelVisible) {
+                    this.hideSettingsPanel();
+                    setTimeout(() => this.showSettingsPanel(), 100);
+                }
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Clear statistics');
+                this.showNotification('Failed to clear statistics', 'error');
+            }
+        }
+
+        // Enhanced notification system with comprehensive user feedback
+        showNotification(message, type = 'info', options = {}) {
+            const operation = EZPrompt.debugSystem?.logOperation('show_notification', { type, message: message.substring(0, 50) });
+
+            try {
+                const config = {
+                    duration: options.duration || 3000,
+                    persistent: options.persistent || false,
+                    actions: options.actions || [],
+                    position: options.position || 'top-right',
+                    ...options
+                };
+
+                // Create notification element
+                const notification = document.createElement('div');
+                notification.className = `ezprompt-notification ezprompt-notification-${type}`;
+
+                // Create notification content
+                const content = document.createElement('div');
+                content.className = 'ezprompt-notification-content';
+
+                const messageEl = document.createElement('div');
+                messageEl.className = 'ezprompt-notification-message';
+                messageEl.textContent = message;
+                content.appendChild(messageEl);
+
+                // Add action buttons if provided
+                if (config.actions.length > 0) {
+                    const actionsEl = document.createElement('div');
+                    actionsEl.className = 'ezprompt-notification-actions';
+
+                    config.actions.forEach(action => {
+                        const button = document.createElement('button');
+                        button.className = 'ezprompt-notification-action';
+                        button.textContent = action.label;
+                        button.onclick = () => {
+                            action.handler();
+                            if (action.closeOnClick !== false) {
+                                this.hideNotification(notification);
+                            }
+                        };
+                        actionsEl.appendChild(button);
+                    });
+
+                    content.appendChild(actionsEl);
+                }
+
+                // Add close button for persistent notifications
+                if (config.persistent) {
+                    const closeBtn = document.createElement('button');
+                    closeBtn.className = 'ezprompt-notification-close';
+                    closeBtn.innerHTML = '×';
+                    closeBtn.onclick = () => this.hideNotification(notification);
+                    content.appendChild(closeBtn);
+                }
+
+                notification.appendChild(content);
+
+                // Add notification styles if not already added
+                if (!document.getElementById('ezprompt-notification-styles')) {
+                    this.addNotificationStyles();
+                }
+
+                // Position notification
+                this.positionNotification(notification, config.position);
+
+                document.body.appendChild(notification);
+
+                // Show notification with animation
+                setTimeout(() => notification.classList.add('visible'), 10);
+
+                // Auto-hide notification if not persistent
+                if (!config.persistent) {
+                    setTimeout(() => {
+                        this.hideNotification(notification);
+                    }, config.duration);
+                }
+
+                // Store notification reference for management
+                this.activeNotifications = this.activeNotifications || [];
+                this.activeNotifications.push(notification);
+
+                EZPrompt.debugSystem?.completeOperation(operation, true);
+                return notification;
+
+            } catch (error) {
+                EZPrompt.debugSystem?.completeOperation(operation, false, error);
+                this.errorHandler?.handleError(error, 'Show notification', {}, false) ||
+                    console.error('Failed to show notification:', error);
+            }
+        }
+
+        hideNotification(notification) {
+            if (!notification || !notification.parentNode) return;
+
+            notification.classList.remove('visible');
+            setTimeout(() => {
+                if (notification.parentNode) {
+                    notification.parentNode.removeChild(notification);
+                }
+
+                // Remove from active notifications
+                if (this.activeNotifications) {
+                    const index = this.activeNotifications.indexOf(notification);
+                    if (index > -1) {
+                        this.activeNotifications.splice(index, 1);
+                    }
+                }
+            }, 300);
+        }
+
+        positionNotification(notification, position) {
+            const positions = {
+                'top-right': { top: '20px', right: '20px' },
+                'top-left': { top: '20px', left: '20px' },
+                'bottom-right': { bottom: '20px', right: '20px' },
+                'bottom-left': { bottom: '20px', left: '20px' },
+                'top-center': { top: '20px', left: '50%', transform: 'translateX(-50%)' },
+                'bottom-center': { bottom: '20px', left: '50%', transform: 'translateX(-50%)' }
+            };
+
+            const pos = positions[position] || positions['top-right'];
+            Object.assign(notification.style, pos);
+        }
+
+        addNotificationStyles() {
+            const styles = document.createElement('style');
+            styles.id = 'ezprompt-notification-styles';
+            styles.textContent = `
+                .ezprompt-notification {
+                    position: fixed !important;
+                    padding: 0 !important;
+                    border-radius: 8px !important;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+                    font-size: 14px !important;
+                    z-index: 10004 !important;
+                    opacity: 0 !important;
+                    transform: translateX(100%) !important;
+                    transition: all 0.3s ease !important;
+                    max-width: 400px !important;
+                    min-width: 300px !important;
+                    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15) !important;
+                    backdrop-filter: blur(10px) !important;
+                }
+                .ezprompt-notification.visible {
+                    opacity: 1 !important;
+                    transform: translateX(0) !important;
+                }
+                .ezprompt-notification-content {
+                    padding: 16px !important;
+                    position: relative !important;
+                }
+                .ezprompt-notification-message {
+                    margin: 0 !important;
+                    line-height: 1.4 !important;
+                    word-wrap: break-word !important;
+                }
+                .ezprompt-notification-actions {
+                    margin-top: 12px !important;
+                    display: flex !important;
+                    gap: 8px !important;
+                    justify-content: flex-end !important;
+                }
+                .ezprompt-notification-action {
+                    padding: 6px 12px !important;
+                    border: none !important;
+                    border-radius: 4px !important;
+                    font-size: 12px !important;
+                    font-weight: 500 !important;
+                    cursor: pointer !important;
+                    transition: all 0.2s ease !important;
+                    background: rgba(255, 255, 255, 0.2) !important;
+                    color: inherit !important;
+                }
+                .ezprompt-notification-action:hover {
+                    background: rgba(255, 255, 255, 0.3) !important;
+                    transform: translateY(-1px) !important;
+                }
+                .ezprompt-notification-close {
+                    position: absolute !important;
+                    top: 8px !important;
+                    right: 8px !important;
+                    width: 24px !important;
+                    height: 24px !important;
+                    border: none !important;
+                    background: rgba(255, 255, 255, 0.2) !important;
+                    color: inherit !important;
+                    border-radius: 50% !important;
+                    cursor: pointer !important;
+                    font-size: 16px !important;
+                    line-height: 1 !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    justify-content: center !important;
+                    transition: all 0.2s ease !important;
+                }
+                .ezprompt-notification-close:hover {
+                    background: rgba(255, 255, 255, 0.3) !important;
+                }
+                .ezprompt-notification-success {
+                    background: linear-gradient(135deg, #10b981, #059669) !important;
+                    color: white !important;
+                    border-left: 4px solid #047857 !important;
+                }
+                .ezprompt-notification-error {
+                    background: linear-gradient(135deg, #ef4444, #dc2626) !important;
+                    color: white !important;
+                    border-left: 4px solid #b91c1c !important;
+                }
+                .ezprompt-notification-warning {
+                    background: linear-gradient(135deg, #f59e0b, #d97706) !important;
+                    color: white !important;
+                    border-left: 4px solid #b45309 !important;
+                }
+                .ezprompt-notification-info {
+                    background: linear-gradient(135deg, #3b82f6, #2563eb) !important;
+                    color: white !important;
+                    border-left: 4px solid #1d4ed8 !important;
+                }
+                .ezprompt-notification-sync {
+                    background: linear-gradient(135deg, #8b5cf6, #7c3aed) !important;
+                    color: white !important;
+                    border-left: 4px solid #6d28d9 !important;
+                }
+                
+                /* Animation for notifications from different positions */
+                .ezprompt-notification[style*="left: 20px"] {
+                    transform: translateX(-100%) !important;
+                }
+                .ezprompt-notification[style*="left: 20px"].visible {
+                    transform: translateX(0) !important;
+                }
+                .ezprompt-notification[style*="bottom:"] {
+                    transform: translateY(100%) !important;
+                }
+                .ezprompt-notification[style*="bottom:"].visible {
+                    transform: translateY(0) !important;
+                }
+                .ezprompt-notification[style*="left: 50%"] {
+                    transform: translateX(-50%) translateY(-100%) !important;
+                }
+                .ezprompt-notification[style*="left: 50%"].visible {
+                    transform: translateX(-50%) translateY(0) !important;
+                }
+            `;
+            document.head.appendChild(styles);
+        }
+
+        // Specialized notification methods
+        showSyncStatus(status, details = {}) {
+            const messages = {
+                'syncing': 'Syncing data...',
+                'success': 'Sync completed successfully',
+                'error': 'Sync failed - working offline',
+                'offline': 'Working offline',
+                'conflict': 'Sync conflict detected'
+            };
+
+            const types = {
+                'syncing': 'sync',
+                'success': 'success',
+                'error': 'error',
+                'offline': 'warning',
+                'conflict': 'warning'
+            };
+
+            const actions = [];
+            if (status === 'error' && details.retryable) {
+                actions.push({
+                    label: 'Retry',
+                    handler: details.retryHandler || (() => { })
+                });
+            }
+
+            if (status === 'conflict') {
+                actions.push({
+                    label: 'Resolve',
+                    handler: details.resolveHandler || (() => { })
+                });
+            }
+
+            return this.showNotification(
+                messages[status] || details.message || 'Unknown sync status',
+                types[status] || 'info',
+                {
+                    duration: status === 'syncing' ? 0 : 5000,
+                    persistent: status === 'syncing' || status === 'conflict',
+                    actions
+                }
+            );
+        }
+
+        showValidationFeedback(field, message, type = 'error') {
+            return this.showNotification(
+                `${field}: ${message}`,
+                type,
+                { duration: 4000 }
+            );
+        }
+
+        showImportFeedback(result) {
+            const { success, failed, total, errors } = result;
+
+            if (failed === 0) {
+                return this.showNotification(
+                    `Successfully imported ${success} items`,
+                    'success'
+                );
+            } else {
+                const actions = [];
+                if (errors && errors.length > 0) {
+                    actions.push({
+                        label: 'View Errors',
+                        handler: () => this.showImportErrors(errors)
+                    });
+                }
+
+                return this.showNotification(
+                    `Imported ${success}/${total} items. ${failed} failed.`,
+                    'warning',
+                    { actions, duration: 8000 }
+                );
+            }
+        }
+
+        showImportErrors(errors) {
+            const errorList = errors.slice(0, 5).map(e => `• ${e.message}`).join('\n');
+            const moreErrors = errors.length > 5 ? `\n... and ${errors.length - 5} more` : '';
+
+            return this.showNotification(
+                `Import errors:\n${errorList}${moreErrors}`,
+                'error',
+                {
+                    persistent: true,
+                    duration: 0
+                }
+            );
+        }
+
+        clearAllNotifications() {
+            if (this.activeNotifications) {
+                this.activeNotifications.forEach(notification => {
+                    this.hideNotification(notification);
+                });
+                this.activeNotifications = [];
+            }
+        }
+
+        // Update prompt panel language
+        updatePromptPanelLanguage() {
+            if (!this.promptPanel) return;
+
+            const searchInput = this.promptPanel.querySelector('.ezprompt-search-input');
+            if (searchInput) {
+                searchInput.placeholder = this.t('panel.search');
+            }
+
+            const categoryHeader = this.promptPanel.querySelector('.ezprompt-category-header');
+            if (categoryHeader) {
+                categoryHeader.textContent = this.t('panel.category');
+            }
+        }
+
+        // Update settings panel language
+        updateSettingsPanelLanguage() {
+            if (!this.settingsPanel) return;
+
+            // This would require rebuilding the panel for full language update
+            // For now, we'll just update the title
+            const title = this.settingsPanel.querySelector('.ezprompt-settings-title');
+            if (title) {
+                title.textContent = this.t('settings.title');
+            }
+        }
+
+        // Track prompt insertion for statistics
+        trackPromptInsertion() {
+            this.statisticsData.sessionInsertions++;
+            this.statisticsData.totalInsertions++;
+        }
+
+        // Filter prompts by search query
+        filterPrompts(query) {
+            this.logger.debug(`Filtering prompts by query: ${query}`);
+
+            if (!this.storage) {
+                this.updatePromptsDisplay([]);
+                return;
+            }
+
+            try {
+                // Get all prompts
+                const allPrompts = this.storage.getAllPrompts ?
+                    Object.values(this.storage.getAllPrompts()) :
+                    (this.storage.prompts || []);
+
+                // Apply current category filter
+                const activeCategory = this.getActiveCategory();
+                let filteredPrompts = activeCategory === 'all' ?
+                    allPrompts :
+                    allPrompts.filter(p => p.category === activeCategory);
+
+                // Apply search filter
+                if (query && query.trim()) {
+                    const searchTerm = query.toLowerCase().trim();
+                    filteredPrompts = filteredPrompts.filter(prompt =>
+                        prompt.name.toLowerCase().includes(searchTerm) ||
+                        prompt.content.toLowerCase().includes(searchTerm) ||
+                        (prompt.tags && prompt.tags.some(tag => tag.toLowerCase().includes(searchTerm)))
+                    );
+                }
+
+                this.updatePromptsDisplay(filteredPrompts);
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Filter prompts');
+                this.updatePromptsDisplay([]);
+            }
+        }
+
+        // Filter prompts by category
+        filterPromptsByCategory(category) {
+            this.logger.debug(`Filtering prompts by category: ${category}`);
+
+            if (!this.storage) {
+                this.updatePromptsDisplay([]);
+                return;
+            }
+
+            try {
+                // Get all prompts
+                const allPrompts = this.storage.getAllPrompts ?
+                    Object.values(this.storage.getAllPrompts()) :
+                    (this.storage.prompts || []);
+
+                // Filter by category
+                const filteredPrompts = category === 'all' ?
+                    allPrompts :
+                    allPrompts.filter(p => p.category === category);
+
+                // Apply current search filter
+                const searchInput = this.promptPanel?.querySelector('.ezprompt-search-input');
+                const searchQuery = searchInput?.value || '';
+
+                let finalPrompts = filteredPrompts;
+                if (searchQuery.trim()) {
+                    const searchTerm = searchQuery.toLowerCase().trim();
+                    finalPrompts = filteredPrompts.filter(prompt =>
+                        prompt.name.toLowerCase().includes(searchTerm) ||
+                        prompt.content.toLowerCase().includes(searchTerm) ||
+                        (prompt.tags && prompt.tags.some(tag => tag.toLowerCase().includes(searchTerm)))
+                    );
+                }
+
+                this.updatePromptsDisplay(finalPrompts);
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Filter prompts by category');
+                this.updatePromptsDisplay([]);
+            }
+        }
+
+        // Get currently active category
+        getActiveCategory() {
+            if (!this.promptPanel) {
+                return 'all';
+            }
+
+            const activeItem = this.promptPanel.querySelector('.ezprompt-category-item.active');
+            return activeItem ? activeItem.dataset.category : 'all';
+        }
+
+        // Update prompts display in panel
+        updatePromptsDisplay(prompts) {
+            if (!this.promptPanel) {
+                return;
+            }
+
+            const promptsList = this.promptPanel.querySelector('.ezprompt-prompts-list');
+            const promptsCount = this.promptPanel.querySelector('.ezprompt-prompts-count');
+
+            if (!promptsList || !promptsCount) {
+                return;
+            }
+
+            // Update count
+            promptsCount.textContent = `${prompts.length} prompt${prompts.length !== 1 ? 's' : ''}`;
+
+            // Clear existing content
+            promptsList.innerHTML = '';
+
+            if (prompts.length === 0) {
+                promptsList.innerHTML = '<div class="ezprompt-no-prompts">No prompts found</div>';
+                return;
+            }
+
+            // Create prompt items
+            prompts.forEach(prompt => {
+                const promptItem = document.createElement('div');
+                promptItem.className = 'ezprompt-prompt-item';
+                promptItem.dataset.promptId = prompt.id;
+
+                promptItem.innerHTML = `
+                    <div class="ezprompt-prompt-name">${this.escapeHtml(prompt.name)}</div>
+                    <div class="ezprompt-prompt-preview">${this.escapeHtml(prompt.content.substring(0, 100))}${prompt.content.length > 100 ? '...' : ''}</div>
+                    <div class="ezprompt-prompt-category">${this.escapeHtml(prompt.category)}</div>
+                `;
+
+                // Add click handler
+                promptItem.addEventListener('click', () => {
+                    this.selectPrompt(prompt);
+                });
+
+                promptsList.appendChild(promptItem);
+            });
+        }
+
+        // Select and insert prompt
+        selectPrompt(prompt) {
+            try {
+                this.logger.info(`Prompt selected: ${prompt.name}`);
+
+                // Hide panel
+                this.hidePromptPanel();
+
+                // Emit event for InputHandler to handle insertion
+                const customEvent = new CustomEvent('ezprompt:prompt-selected', {
+                    detail: {
+                        prompt,
+                        inputElement: this.currentInputElement
+                    }
+                });
+                document.dispatchEvent(customEvent);
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Prompt selection');
+            }
+        }
+
+        // Escape HTML to prevent XSS
+        escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Show prompt selection panel
+        showPromptPanel(position) {
+            try {
+                // Hide any existing panel first
+                this.hidePromptPanel();
+
+                // Create panel if it doesn't exist
+                if (!this.promptPanel) {
+                    this.promptPanel = this.createPromptPanel();
+                }
+
+                // Position panel
+                this.positionPromptPanel(position);
+
+                // Show panel with animation
+                this.promptPanel.classList.add('visible');
+
+                // Focus search input
+                const searchInput = this.promptPanel.querySelector('.ezprompt-search-input');
+                if (searchInput) {
+                    setTimeout(() => searchInput.focus(), 100);
+                }
+
+                // Setup event listeners
+                this.setupPromptPanelEvents();
+
+                this.logger.debug('Prompt panel shown');
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Show prompt panel');
+            }
+        }
+
+        hidePromptPanel() {
+            if (!this.promptPanel) {
+                return;
+            }
+
+            try {
+                // Hide panel with animation
+                this.promptPanel.classList.remove('visible');
+
+                // Remove from DOM after animation
+                setTimeout(() => {
+                    if (this.promptPanel && this.promptPanel.parentNode) {
+                        this.promptPanel.parentNode.removeChild(this.promptPanel);
+                    }
+                    this.promptPanel = null;
+                }, 200);
+
+                // Cleanup event listeners
+                this.cleanupPromptPanelEvents();
+
+                this.logger.debug('Prompt panel hidden');
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Hide prompt panel');
+            }
+        }
+
+        // Show settings panel
+        showSettingsPanel() {
+            try {
+                // Hide any existing panels first
+                this.hidePromptPanel();
+                this.hideSettingsPanel();
+
+                // Create settings panel if it doesn't exist
+                if (!this.settingsPanel) {
+                    this.settingsPanel = this.createSettingsPanel();
+                }
+
+                // Position panel in center of screen
+                this.positionSettingsPanel();
+
+                // Show panel with animation
+                this.settingsPanel.classList.add('visible');
+                this.settingsPanelVisible = true;
+
+                // Setup event listeners
+                this.setupSettingsPanelEvents();
+
+                this.logger.debug('Settings panel shown');
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Show settings panel');
+            }
+        }
+
+        hideSettingsPanel() {
+            if (!this.settingsPanel) {
+                return;
+            }
+
+            try {
+                // Hide panel with animation
+                this.settingsPanel.classList.remove('visible');
+                this.settingsPanelVisible = false;
+
+                // Remove from DOM after animation
+                setTimeout(() => {
+                    if (this.settingsPanel && this.settingsPanel.parentNode) {
+                        this.settingsPanel.parentNode.removeChild(this.settingsPanel);
+                    }
+                    this.settingsPanel = null;
+                }, 200);
+
+                // Cleanup event listeners
+                this.cleanupSettingsPanelEvents();
+
+                this.logger.debug('Settings panel hidden');
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Hide settings panel');
+            }
+        }
+
+        showAutocomplete(matches, position) {
+            this.logger.debug('Showing autocomplete with matches:', matches?.length || 0);
+
+            if (this.autocompletePanel) {
+                this.hideAutocomplete();
+            }
+
+            // Create autocomplete panel
+            this.autocompletePanel = this.createAutocompletePanel(matches, position);
+            if (this.autocompletePanel) {
+                document.body.appendChild(this.autocompletePanel);
+                this.selectedIndex = 0;
+                this.updateSelection();
+            }
+        }
+
+        hideAutocomplete() {
+            this.logger.debug('Hiding autocomplete');
+
+            if (this.autocompletePanel) {
+                if (this.autocompletePanel.parentNode) {
+                    this.autocompletePanel.parentNode.removeChild(this.autocompletePanel);
+                }
+                this.autocompletePanel = null;
+                this.selectedIndex = -1;
+            }
+        }
+
+        handleKeyNavigation(event) {
+            this.logger.debug('handleKeyNavigation called - will be implemented in tasks 6-7');
+            // TODO: Implement in tasks 6-7
+        }
+
+        // Fuzzy search algorithm for prompts
+        fuzzySearch(query, prompts) {
+            if (!query || query.trim() === '') {
+                return prompts.slice(0, this.autocompleteConfig.maxItems);
+            }
+
+            const normalizedQuery = query.toLowerCase().trim();
+            const results = [];
+
+            for (const prompt of prompts) {
+                const score = this.calculateFuzzyScore(normalizedQuery, prompt);
+                if (score > 0) {
+                    results.push({ prompt, score });
+                }
+            }
+
+            // Sort by score (descending) and return prompts
+            return results
+                .sort((a, b) => b.score - a.score)
+                .slice(0, this.autocompleteConfig.maxItems)
+                .map(result => result.prompt);
+        }
+
+        // Calculate fuzzy match score
+        calculateFuzzyScore(query, prompt) {
+            const name = prompt.name.toLowerCase();
+            const content = prompt.content.toLowerCase();
+            const category = (prompt.category || '').toLowerCase();
+
+            let score = 0;
+
+            // Exact name match gets highest score
+            if (name === query) {
+                score += 100;
+            }
+            // Name starts with query
+            else if (name.startsWith(query)) {
+                score += 80;
+            }
+            // Name contains query
+            else if (name.includes(query)) {
+                score += 60;
+            }
+
+            // Content matches
+            if (content.includes(query)) {
+                score += 30;
+            }
+
+            // Category matches
+            if (category.includes(query)) {
+                score += 20;
+            }
+
+            // Bonus for shorter names (more relevant)
+            if (score > 0 && name.length < 50) {
+                score += Math.max(0, 10 - name.length / 5);
+            }
+
+            // Character-by-character fuzzy matching for partial matches
+            if (score === 0) {
+                const fuzzyScore = this.fuzzyMatchScore(query, name);
+                if (fuzzyScore > 0.3) {
+                    score = fuzzyScore * 40;
+                }
+            }
+
+            return score;
+        }
+
+        // Character-by-character fuzzy matching
+        fuzzyMatchScore(query, text) {
+            if (query.length === 0) return 1;
+            if (text.length === 0) return 0;
+
+            let queryIndex = 0;
+            let textIndex = 0;
+            let matches = 0;
+
+            while (queryIndex < query.length && textIndex < text.length) {
+                if (query[queryIndex] === text[textIndex]) {
+                    matches++;
+                    queryIndex++;
+                }
+                textIndex++;
+            }
+
+            return matches / query.length;
+        }
+
+        // Cleanup all UI components
+        cleanup() {
+            this.logger.debug('Cleaning up UIManager');
+
+            // Hide and cleanup prompt panel
+            this.hidePromptPanel();
+
+            // Hide autocomplete
+            this.hideAutocomplete();
+
+            // Remove all buttons
+            for (const inputElement of this.activeButtons.keys()) {
+                this.removeInputButton(inputElement);
+            }
+
+            // Remove styles
+            const styleElement = document.getElementById('ezprompt-styles');
+            if (styleElement) {
+                styleElement.remove();
+            }
+
+            // Clear references
+            this.activeButtons.clear();
+            this.promptPanel = null;
+            this.autocompletePanel = null;
+            this.currentInputElement = null;
+            this.selectedIndex = -1;
+        }
+
+        // Initialize UIManager
+        async initialize() {
+            this.logger.info('Initializing UIManager');
+
+            // Initialize language and theme from user config
+            if (this.storage) {
+                const config = this.storage.getUserConfig();
+                if (config) {
+                    // Set language
+                    if (config.language) {
+                        this.setLanguage(config.language);
+                    }
+
+                    // Apply theme
+                    if (config.ui_theme) {
+                        this.applyTheme(config.ui_theme);
+                    }
+                }
+            }
+
+            // Initialize session statistics
+            this.statisticsData.sessionStart = Date.now();
+
+            this.logger.info('UIManager initialized');
+        }
+    }
+
+    // Storage Manager Class
+    class StorageManager {
+        constructor(dependencies = {}) {
+            this.logger = dependencies.logger || EZPrompt.logger;
+            this.errorHandler = dependencies.errorHandler || EZPrompt.errorHandler;
+
+            // Storage keys
+            this.STORAGE_KEYS = {
+                PROMPTS: 'ezprompt_prompts',
+                CATEGORIES: 'ezprompt_categories',
+                CONFIG: 'ezprompt_config',
+                CUSTOM_SITES: 'ezprompt_custom_sites',
+                VARIABLE_HISTORY: 'ezprompt_variable_history',
+                SCHEMA_VERSION: 'ezprompt_schema_version'
+            };
+
+            this.CURRENT_SCHEMA_VERSION = 1;
+            this.dataModels = DataModels;
+        }
+
+        // Schema migration support
+        async migrateSchema() {
+            try {
+                const currentVersion = parseInt(GM_getValue(this.STORAGE_KEYS.SCHEMA_VERSION, '0'));
+
+                if (currentVersion < this.CURRENT_SCHEMA_VERSION) {
+                    this.logger.info(`Migrating schema from version ${currentVersion} to ${this.CURRENT_SCHEMA_VERSION}`);
+
+                    // Perform migrations based on version
+                    if (currentVersion === 0) {
+                        await this.migrateFromV0ToV1();
+                    }
+
+                    // Update schema version
+                    GM_setValue(this.STORAGE_KEYS.SCHEMA_VERSION, this.CURRENT_SCHEMA_VERSION.toString());
+                    this.logger.info('Schema migration completed successfully');
+                }
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'schema migration');
+                throw new Error('Schema migration failed: ' + error.message);
+            }
+        }
+
+        async migrateFromV0ToV1() {
+            // Initialize default categories if they don't exist
+            const categories = this.getAllCategories();
+            if (Object.keys(categories).length === 0) {
+                const defaultCategory = this.dataModels.createCategory({
+                    id: 'default',
+                    name: 'Default'
+                });
+                this.saveCategory(defaultCategory);
+            }
+
+            // Ensure all prompts have required fields
+            const prompts = this.getAllPrompts();
+            for (const [id, prompt] of Object.entries(prompts)) {
+                try {
+                    const updatedPrompt = this.dataModels.createPrompt(prompt);
+                    this.savePrompt(updatedPrompt);
+                } catch (error) {
+                    this.logger.warn(`Removing invalid prompt during migration: ${id}`, error);
+                    this.deletePrompt(id);
+                }
+            }
+
+            // Initialize default config if it doesn't exist
+            const config = this.getUserConfig();
+            if (!config) {
+                const defaultConfig = this.dataModels.createUserConfig();
+                this.saveUserConfig(defaultConfig);
+            }
+        }
+
+        // Prompt CRUD operations
+        savePrompt(prompt) {
+            try {
+                // Validate prompt data
+                const validatedPrompt = this.dataModels.createPrompt(prompt);
+                validatedPrompt.updated_at = new Date().toISOString();
+
+                // Get existing prompts
+                const prompts = this.getAllPrompts();
+
+                // Save prompt
+                prompts[validatedPrompt.id] = validatedPrompt;
+                GM_setValue(this.STORAGE_KEYS.PROMPTS, EZPrompt.utils.safeJsonStringify(prompts));
+
+                this.logger.debug(`Prompt saved: ${validatedPrompt.id}`);
+                return validatedPrompt;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, prompt);
+                throw new Error('Failed to save prompt: ' + error.message);
+            }
+        }
+
+        getPrompt(id) {
+            try {
+                const prompts = this.getAllPrompts();
+                return prompts[id] || null;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, id);
+                return null;
+            }
+        }
+
+        getAllPrompts() {
+            try {
+                const promptsData = GM_getValue(this.STORAGE_KEYS.PROMPTS, '{}');
+                return EZPrompt.utils.safeJsonParse(promptsData, {});
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'prompts');
+                return {};
+            }
+        }
+
+        updatePrompt(id, updates) {
+            try {
+                const existingPrompt = this.getPrompt(id);
+                if (!existingPrompt) {
+                    throw new Error(`Prompt not found: ${id}`);
+                }
+
+                const updatedPrompt = { ...existingPrompt, ...updates };
+                return this.savePrompt(updatedPrompt);
+            } catch (error) {
+                this.errorHandler.handleDataError(error, { id, updates });
+                throw new Error('Failed to update prompt: ' + error.message);
+            }
+        }
+
+        deletePrompt(id) {
+            try {
+                const prompts = this.getAllPrompts();
+
+                if (!prompts[id]) {
+                    this.logger.warn(`Prompt not found for deletion: ${id}`);
+                    return false;
+                }
+
+                delete prompts[id];
+                GM_setValue(this.STORAGE_KEYS.PROMPTS, EZPrompt.utils.safeJsonStringify(prompts));
+
+                this.logger.debug(`Prompt deleted: ${id}`);
+                return true;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, id);
+                throw new Error('Failed to delete prompt: ' + error.message);
+            }
+        }
+
+        // Category CRUD operations
+        saveCategory(category) {
+            try {
+                // Validate category data
+                const validatedCategory = this.dataModels.createCategory(category);
+                validatedCategory.updated_at = new Date().toISOString();
+
+                // Get existing categories
+                const categories = this.getAllCategories();
+
+                // Save category
+                categories[validatedCategory.id] = validatedCategory;
+                GM_setValue(this.STORAGE_KEYS.CATEGORIES, EZPrompt.utils.safeJsonStringify(categories));
+
+                this.logger.debug(`Category saved: ${validatedCategory.id}`);
+                return validatedCategory;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, category);
+                throw new Error('Failed to save category: ' + error.message);
+            }
+        }
+
+        getCategory(id) {
+            try {
+                const categories = this.getAllCategories();
+                return categories[id] || null;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, id);
+                return null;
+            }
+        }
+
+        getAllCategories() {
+            try {
+                const categoriesData = GM_getValue(this.STORAGE_KEYS.CATEGORIES, '{}');
+                return EZPrompt.utils.safeJsonParse(categoriesData, {});
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'categories');
+                return {};
+            }
+        }
+
+        updateCategory(id, updates) {
+            try {
+                const existingCategory = this.getCategory(id);
+                if (!existingCategory) {
+                    throw new Error(`Category not found: ${id}`);
+                }
+
+                const updatedCategory = { ...existingCategory, ...updates };
+                return this.saveCategory(updatedCategory);
+            } catch (error) {
+                this.errorHandler.handleDataError(error, { id, updates });
+                throw new Error('Failed to update category: ' + error.message);
+            }
+        }
+
+        deleteCategory(id) {
+            try {
+                const categories = this.getAllCategories();
+
+                if (!categories[id]) {
+                    this.logger.warn(`Category not found for deletion: ${id}`);
+                    return false;
+                }
+
+                // Check if category has child categories
+                const hasChildren = Object.values(categories).some(cat => cat.parent_id === id);
+                if (hasChildren) {
+                    throw new Error('Cannot delete category with child categories');
+                }
+
+                // Check if category has prompts
+                const prompts = this.getAllPrompts();
+                const hasPrompts = Object.values(prompts).some(prompt => prompt.category === id);
+                if (hasPrompts) {
+                    throw new Error('Cannot delete category with prompts');
+                }
+
+                delete categories[id];
+                GM_setValue(this.STORAGE_KEYS.CATEGORIES, EZPrompt.utils.safeJsonStringify(categories));
+
+                this.logger.debug(`Category deleted: ${id}`);
+                return true;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, id);
+                throw new Error('Failed to delete category: ' + error.message);
+            }
+        }
+
+        // Category management functionality
+        getPromptsByCategory(categoryId) {
+            try {
+                const prompts = this.getAllPrompts();
+                return Object.values(prompts).filter(prompt => prompt.category === categoryId);
+            } catch (error) {
+                this.errorHandler.handleDataError(error, categoryId);
+                return [];
+            }
+        }
+
+        getCategoryHierarchy() {
+            try {
+                const categories = this.getAllCategories();
+                const hierarchy = {};
+
+                // Build hierarchy tree
+                for (const category of Object.values(categories)) {
+                    if (!category.parent_id) {
+                        // Root category
+                        hierarchy[category.id] = {
+                            ...category,
+                            children: []
+                        };
+                    }
+                }
+
+                // Add child categories
+                for (const category of Object.values(categories)) {
+                    if (category.parent_id && hierarchy[category.parent_id]) {
+                        hierarchy[category.parent_id].children.push({
+                            ...category,
+                            children: []
+                        });
+                    }
+                }
+
+                return hierarchy;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'category hierarchy');
+                return {};
+            }
+        }
+
+        movePromptsToCategory(promptIds, targetCategoryId) {
+            try {
+                // Validate target category exists
+                const targetCategory = this.getCategory(targetCategoryId);
+                if (!targetCategory) {
+                    throw new Error(`Target category not found: ${targetCategoryId}`);
+                }
+
+                const results = [];
+                for (const promptId of promptIds) {
+                    try {
+                        const updatedPrompt = this.updatePrompt(promptId, { category: targetCategoryId });
+                        results.push({ id: promptId, success: true, prompt: updatedPrompt });
+                    } catch (error) {
+                        results.push({ id: promptId, success: false, error: error.message });
+                    }
+                }
+
+                return results;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, { promptIds, targetCategoryId });
+                throw new Error('Failed to move prompts: ' + error.message);
+            }
+        }
+
+        // User Config operations
+        saveUserConfig(config) {
+            try {
+                const validatedConfig = this.dataModels.createUserConfig(config);
+                validatedConfig.updated_at = new Date().toISOString();
+
+                GM_setValue(this.STORAGE_KEYS.CONFIG, EZPrompt.utils.safeJsonStringify(validatedConfig));
+
+                this.logger.debug('User config saved');
+                return validatedConfig;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, config);
+                throw new Error('Failed to save user config: ' + error.message);
+            }
+        }
+
+        getUserConfig() {
+            try {
+                const configData = GM_getValue(this.STORAGE_KEYS.CONFIG, null);
+                if (!configData) {
+                    return null;
+                }
+
+                const config = EZPrompt.utils.safeJsonParse(configData, null);
+                return config ? this.dataModels.createUserConfig(config) : null;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'user config');
+                return null;
+            }
+        }
+
+        updateUserConfig(updates) {
+            try {
+                const existingConfig = this.getUserConfig() || this.dataModels.createUserConfig();
+                const updatedConfig = { ...existingConfig, ...updates };
+                return this.saveUserConfig(updatedConfig);
+            } catch (error) {
+                this.errorHandler.handleDataError(error, updates);
+                throw new Error('Failed to update user config: ' + error.message);
+            }
+        }
+
+        // Variable history operations
+        saveVariableHistory(variableName, value) {
+            try {
+                const historyData = GM_getValue(this.STORAGE_KEYS.VARIABLE_HISTORY, '{}');
+                const history = EZPrompt.utils.safeJsonParse(historyData, {});
+
+                if (!history[variableName]) {
+                    history[variableName] = [];
+                }
+
+                // Add new value to beginning of array
+                history[variableName].unshift(value);
+
+                // Keep only last 10 values
+                history[variableName] = history[variableName].slice(0, 10);
+
+                GM_setValue(this.STORAGE_KEYS.VARIABLE_HISTORY, EZPrompt.utils.safeJsonStringify(history));
+
+                this.logger.debug(`Variable history saved: ${variableName}`);
+            } catch (error) {
+                this.errorHandler.handleDataError(error, { variableName, value });
+            }
+        }
+
+        getVariableHistory(variableName) {
+            try {
+                const historyData = GM_getValue(this.STORAGE_KEYS.VARIABLE_HISTORY, '{}');
+                const history = EZPrompt.utils.safeJsonParse(historyData, {});
+                return history[variableName] || [];
+            } catch (error) {
+                this.errorHandler.handleDataError(error, variableName);
+                return [];
+            }
+        }
+
+        // Bulk operations
+        bulkDeletePrompts(promptIds) {
+            try {
+                const results = [];
+                for (const id of promptIds) {
+                    try {
+                        const success = this.deletePrompt(id);
+                        results.push({ id, success, error: null });
+                    } catch (error) {
+                        results.push({ id, success: false, error: error.message });
+                    }
+                }
+                return results;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, promptIds);
+                throw new Error('Failed to bulk delete prompts: ' + error.message);
+            }
+        }
+
+        bulkDeleteCategories(categoryIds) {
+            try {
+                const results = [];
+                for (const id of categoryIds) {
+                    try {
+                        const success = this.deleteCategory(id);
+                        results.push({ id, success, error: null });
+                    } catch (error) {
+                        results.push({ id, success: false, error: error.message });
+                    }
+                }
+                return results;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, categoryIds);
+                throw new Error('Failed to bulk delete categories: ' + error.message);
+            }
+        }
+
+        // Data export/import
+        exportData() {
+            try {
+                const data = {
+                    version: this.CURRENT_SCHEMA_VERSION,
+                    exported_at: new Date().toISOString(),
+                    prompts: this.getAllPrompts(),
+                    categories: this.getAllCategories(),
+                    config: this.getUserConfig(),
+                    variable_history: EZPrompt.utils.safeJsonParse(GM_getValue(this.STORAGE_KEYS.VARIABLE_HISTORY, '{}'), {})
+                };
+
+                this.logger.info('Data exported successfully');
+                return data;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'export');
+                throw new Error('Failed to export data: ' + error.message);
+            }
+        }
+
+        importData(data, options = {}) {
+            try {
+                const { merge = false, overwrite = false } = options;
+
+                if (!data || typeof data !== 'object') {
+                    throw new Error('Invalid import data format');
+                }
+
+                const results = {
+                    prompts: { imported: 0, skipped: 0, errors: [] },
+                    categories: { imported: 0, skipped: 0, errors: [] },
+                    config: { imported: false, error: null }
+                };
+
+                // Import categories first
+                if (data.categories) {
+                    for (const [id, category] of Object.entries(data.categories)) {
+                        try {
+                            const existingCategory = this.getCategory(id);
+
+                            if (existingCategory && !overwrite && !merge) {
+                                results.categories.skipped++;
+                                continue;
+                            }
+
+                            this.saveCategory(category);
+                            results.categories.imported++;
+                        } catch (error) {
+                            results.categories.errors.push({ id, error: error.message });
+                        }
+                    }
+                }
+
+                // Import prompts
+                if (data.prompts) {
+                    for (const [id, prompt] of Object.entries(data.prompts)) {
+                        try {
+                            const existingPrompt = this.getPrompt(id);
+
+                            if (existingPrompt && !overwrite && !merge) {
+                                results.prompts.skipped++;
+                                continue;
+                            }
+
+                            this.savePrompt(prompt);
+                            results.prompts.imported++;
+                        } catch (error) {
+                            results.prompts.errors.push({ id, error: error.message });
+                        }
+                    }
+                }
+
+                // Import config
+                if (data.config && (overwrite || !this.getUserConfig())) {
+                    try {
+                        this.saveUserConfig(data.config);
+                        results.config.imported = true;
+                    } catch (error) {
+                        results.config.error = error.message;
+                    }
+                }
+
+                this.logger.info('Data import completed', results);
+                return results;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, data);
+                throw new Error('Failed to import data: ' + error.message);
+            }
+        }
+
+        // Clear all data
+        clearAllData() {
+            try {
+                GM_deleteValue(this.STORAGE_KEYS.PROMPTS);
+                GM_deleteValue(this.STORAGE_KEYS.CATEGORIES);
+                GM_deleteValue(this.STORAGE_KEYS.CONFIG);
+                GM_deleteValue(this.STORAGE_KEYS.VARIABLE_HISTORY);
+
+                this.logger.info('All data cleared');
+                return true;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'clear all data');
+                throw new Error('Failed to clear data: ' + error.message);
+            }
+        }
+
+        // Get storage statistics
+        getStorageStats() {
+            try {
+                const prompts = this.getAllPrompts();
+                const categories = this.getAllCategories();
+                const config = this.getUserConfig();
+
+                return {
+                    prompts: {
+                        count: Object.keys(prompts).length,
+                        total_usage: Object.values(prompts).reduce((sum, p) => sum + (p.usage_count || 0), 0)
+                    },
+                    categories: {
+                        count: Object.keys(categories).length
+                    },
+                    config: {
+                        exists: !!config
+                    },
+                    storage_keys: Object.keys(this.STORAGE_KEYS).length
+                };
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'storage stats');
+                return null;
+            }
+        }
+
+        // Data Import/Export functionality
+        exportAllData() {
+            try {
+                const exportData = {
+                    version: '1.0.0',
+                    exported_at: new Date().toISOString(),
+                    data: {
+                        prompts: this.getAllPrompts(),
+                        categories: this.getAllCategories(),
+                        config: this.getUserConfig(),
+                        custom_sites: EZPrompt.utils.safeJsonParse(GM_getValue(this.STORAGE_KEYS.CUSTOM_SITES, '{}'), {}),
+                        variable_history: EZPrompt.utils.safeJsonParse(GM_getValue(this.STORAGE_KEYS.VARIABLE_HISTORY, '{}'), {})
+                    }
+                };
+
+                this.logger.info('Data exported successfully');
+                return exportData;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'export operation');
+                throw new Error('Failed to export data: ' + error.message);
+            }
+        }
+
+        exportToJSON() {
+            try {
+                const exportData = this.exportAllData();
+                const jsonString = EZPrompt.utils.safeJsonStringify(exportData, null, 2);
+
+                // Create downloadable blob
+                const blob = new Blob([jsonString], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+
+                // Create download link
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = `ezprompt-backup-${new Date().toISOString().split('T')[0]}.json`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+
+                // Clean up
+                URL.revokeObjectURL(url);
+
+                this.logger.info('JSON export completed');
+                return true;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'JSON export');
+                throw new Error('Failed to export JSON: ' + error.message);
+            }
+        }
+
+        validateImportData(data) {
+            try {
+                if (!data || typeof data !== 'object') {
+                    throw new Error('Invalid import data: must be an object');
+                }
+
+                if (!data.version) {
+                    throw new Error('Invalid import data: missing version');
+                }
+
+                if (!data.data || typeof data.data !== 'object') {
+                    throw new Error('Invalid import data: missing data object');
+                }
+
+                const { prompts, categories, config } = data.data;
+
+                // Validate prompts
+                if (prompts && typeof prompts === 'object') {
+                    for (const [id, prompt] of Object.entries(prompts)) {
+                        try {
+                            this.dataModels.validatePrompt(prompt);
+                        } catch (error) {
+                            throw new Error(`Invalid prompt ${id}: ${error.message}`);
+                        }
+                    }
+                }
+
+                // Validate categories
+                if (categories && typeof categories === 'object') {
+                    for (const [id, category] of Object.entries(categories)) {
+                        try {
+                            this.dataModels.validateCategory(category);
+                        } catch (error) {
+                            throw new Error(`Invalid category ${id}: ${error.message}`);
+                        }
+                    }
+                }
+
+                // Validate config
+                if (config && typeof config === 'object') {
+                    try {
+                        this.dataModels.validateUserConfig(config);
+                    } catch (error) {
+                        throw new Error(`Invalid config: ${error.message}`);
+                    }
+                }
+
+                return true;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, data);
+                throw error;
+            }
+        }
+
+        importFromJSON(jsonData, options = {}) {
+            try {
+                const {
+                    mergeMode = 'merge', // 'merge', 'replace', 'skip'
+                    selectedTypes = ['prompts', 'categories', 'config'],
+                    conflictResolution = 'skip' // 'skip', 'overwrite', 'rename'
+                } = options;
+
+                let importData;
+                if (typeof jsonData === 'string') {
+                    importData = EZPrompt.utils.safeJsonParse(jsonData);
+                    if (!importData) {
+                        throw new Error('Invalid JSON format');
+                    }
+                } else {
+                    importData = jsonData;
+                }
+
+                // Validate import data
+                this.validateImportData(importData);
+
+                const results = {
+                    success: true,
+                    imported: {
+                        prompts: 0,
+                        categories: 0,
+                        config: false
+                    },
+                    conflicts: [],
+                    errors: []
+                };
+
+                // Import categories first (prompts depend on them)
+                if (selectedTypes.includes('categories') && importData.data.categories) {
+                    const categoryResults = this.importCategories(importData.data.categories, conflictResolution);
+                    results.imported.categories = categoryResults.imported;
+                    results.conflicts.push(...categoryResults.conflicts);
+                    results.errors.push(...categoryResults.errors);
+                }
+
+                // Import prompts
+                if (selectedTypes.includes('prompts') && importData.data.prompts) {
+                    const promptResults = this.importPrompts(importData.data.prompts, conflictResolution);
+                    results.imported.prompts = promptResults.imported;
+                    results.conflicts.push(...promptResults.conflicts);
+                    results.errors.push(...promptResults.errors);
+                }
+
+                // Import config
+                if (selectedTypes.includes('config') && importData.data.config) {
+                    try {
+                        if (mergeMode === 'replace' || !this.getUserConfig()) {
+                            this.saveUserConfig(importData.data.config);
+                        } else if (mergeMode === 'merge') {
+                            const existingConfig = this.getUserConfig();
+                            const mergedConfig = { ...existingConfig, ...importData.data.config };
+                            this.saveUserConfig(mergedConfig);
+                        }
+                        results.imported.config = true;
+                    } catch (error) {
+                        results.errors.push(`Config import failed: ${error.message}`);
+                    }
+                }
+
+                this.logger.info('Import completed', results);
+                return results;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'import operation');
+                throw new Error('Failed to import data: ' + error.message);
+            }
+        }
+
+        importCategories(categories, conflictResolution = 'skip') {
+            const results = {
+                imported: 0,
+                conflicts: [],
+                errors: []
+            };
+
+            try {
+                const existingCategories = this.getAllCategories();
+
+                for (const [id, category] of Object.entries(categories)) {
+                    try {
+                        if (existingCategories[id]) {
+                            // Handle conflict
+                            if (conflictResolution === 'skip') {
+                                results.conflicts.push({
+                                    type: 'category',
+                                    id: id,
+                                    name: category.name,
+                                    action: 'skipped'
+                                });
+                                continue;
+                            } else if (conflictResolution === 'overwrite') {
+                                this.saveCategory(category);
+                                results.imported++;
+                                results.conflicts.push({
+                                    type: 'category',
+                                    id: id,
+                                    name: category.name,
+                                    action: 'overwritten'
+                                });
+                            } else if (conflictResolution === 'rename') {
+                                const newCategory = { ...category };
+                                newCategory.id = EZPrompt.utils.generateId();
+                                newCategory.name = `${category.name} (imported)`;
+                                this.saveCategory(newCategory);
+                                results.imported++;
+                                results.conflicts.push({
+                                    type: 'category',
+                                    id: id,
+                                    name: category.name,
+                                    action: 'renamed',
+                                    newId: newCategory.id
+                                });
+                            }
+                        } else {
+                            // No conflict, import directly
+                            this.saveCategory(category);
+                            results.imported++;
+                        }
+                    } catch (error) {
+                        results.errors.push(`Category ${id}: ${error.message}`);
+                    }
+                }
+            } catch (error) {
+                results.errors.push(`Category import failed: ${error.message}`);
+            }
+
+            return results;
+        }
+
+        importPrompts(prompts, conflictResolution = 'skip') {
+            const results = {
+                imported: 0,
+                conflicts: [],
+                errors: []
+            };
+
+            try {
+                const existingPrompts = this.getAllPrompts();
+                const existingCategories = this.getAllCategories();
+
+                for (const [id, prompt] of Object.entries(prompts)) {
+                    try {
+                        // Check if category exists, create default if not
+                        if (prompt.category && !existingCategories[prompt.category]) {
+                            const defaultCategory = this.dataModels.createCategory({
+                                id: prompt.category,
+                                name: prompt.category.charAt(0).toUpperCase() + prompt.category.slice(1)
+                            });
+                            this.saveCategory(defaultCategory);
+                        }
+
+                        if (existingPrompts[id]) {
+                            // Handle conflict
+                            if (conflictResolution === 'skip') {
+                                results.conflicts.push({
+                                    type: 'prompt',
+                                    id: id,
+                                    name: prompt.name,
+                                    action: 'skipped'
+                                });
+                                continue;
+                            } else if (conflictResolution === 'overwrite') {
+                                this.savePrompt(prompt);
+                                results.imported++;
+                                results.conflicts.push({
+                                    type: 'prompt',
+                                    id: id,
+                                    name: prompt.name,
+                                    action: 'overwritten'
+                                });
+                            } else if (conflictResolution === 'rename') {
+                                const newPrompt = { ...prompt };
+                                newPrompt.id = EZPrompt.utils.generateId();
+                                newPrompt.name = `${prompt.name} (imported)`;
+                                this.savePrompt(newPrompt);
+                                results.imported++;
+                                results.conflicts.push({
+                                    type: 'prompt',
+                                    id: id,
+                                    name: prompt.name,
+                                    action: 'renamed',
+                                    newId: newPrompt.id
+                                });
+                            }
+                        } else {
+                            // No conflict, import directly
+                            this.savePrompt(prompt);
+                            results.imported++;
+                        }
+                    } catch (error) {
+                        results.errors.push(`Prompt ${id}: ${error.message}`);
+                    }
+                }
+            } catch (error) {
+                results.errors.push(`Prompt import failed: ${error.message}`);
+            }
+
+            return results;
+        }
+
+        importFromCSV(csvData, options = {}) {
+            try {
+                const {
+                    delimiter = ',',
+                    hasHeader = true,
+                    categoryColumn = 'category',
+                    nameColumn = 'name',
+                    contentColumn = 'content',
+                    tagsColumn = 'tags',
+                    conflictResolution = 'skip'
+                } = options;
+
+                // Parse CSV data
+                const lines = csvData.split('\n').filter(line => line.trim());
+                if (lines.length === 0) {
+                    throw new Error('CSV file is empty');
+                }
+
+                let headers = [];
+                let dataStartIndex = 0;
+
+                if (hasHeader) {
+                    headers = this.parseCSVLine(lines[0], delimiter);
+                    dataStartIndex = 1;
+                } else {
+                    // Use default column indices
+                    headers = ['name', 'content', 'category', 'tags'];
+                }
+
+                // Find column indices
+                const columnIndices = {
+                    name: this.findColumnIndex(headers, nameColumn),
+                    content: this.findColumnIndex(headers, contentColumn),
+                    category: this.findColumnIndex(headers, categoryColumn),
+                    tags: this.findColumnIndex(headers, tagsColumn)
+                };
+
+                if (columnIndices.name === -1 || columnIndices.content === -1) {
+                    throw new Error('CSV must contain name and content columns');
+                }
+
+                const results = {
+                    success: true,
+                    imported: 0,
+                    conflicts: [],
+                    errors: []
+                };
+
+                // Process data rows
+                for (let i = dataStartIndex; i < lines.length; i++) {
+                    try {
+                        const row = this.parseCSVLine(lines[i], delimiter);
+
+                        if (row.length < Math.max(columnIndices.name, columnIndices.content) + 1) {
+                            results.errors.push(`Row ${i + 1}: Insufficient columns`);
+                            continue;
+                        }
+
+                        const prompt = {
+                            id: EZPrompt.utils.generateId(),
+                            name: row[columnIndices.name]?.trim() || '',
+                            content: row[columnIndices.content]?.trim() || '',
+                            category: columnIndices.category !== -1 ? (row[columnIndices.category]?.trim() || 'default') : 'default',
+                            tags: columnIndices.tags !== -1 ? this.parseCSVTags(row[columnIndices.tags]) : []
+                        };
+
+                        if (!prompt.name || !prompt.content) {
+                            results.errors.push(`Row ${i + 1}: Missing name or content`);
+                            continue;
+                        }
+
+                        // Check for existing prompt with same name
+                        const existingPrompts = this.getAllPrompts();
+                        const existingPrompt = Object.values(existingPrompts).find(p => p.name === prompt.name);
+
+                        if (existingPrompt) {
+                            if (conflictResolution === 'skip') {
+                                results.conflicts.push({
+                                    type: 'prompt',
+                                    name: prompt.name,
+                                    action: 'skipped',
+                                    row: i + 1
+                                });
+                                continue;
+                            } else if (conflictResolution === 'rename') {
+                                prompt.name = `${prompt.name} (imported)`;
+                            }
+                        }
+
+                        // Ensure category exists
+                        const existingCategories = this.getAllCategories();
+                        if (!existingCategories[prompt.category]) {
+                            const category = this.dataModels.createCategory({
+                                id: prompt.category,
+                                name: prompt.category.charAt(0).toUpperCase() + prompt.category.slice(1)
+                            });
+                            this.saveCategory(category);
+                        }
+
+                        this.savePrompt(prompt);
+                        results.imported++;
+
+                    } catch (error) {
+                        results.errors.push(`Row ${i + 1}: ${error.message}`);
+                    }
+                }
+
+                this.logger.info('CSV import completed', results);
+                return results;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'CSV import');
+                throw new Error('Failed to import CSV: ' + error.message);
+            }
+        }
+
+        parseCSVLine(line, delimiter = ',') {
+            const result = [];
+            let current = '';
+            let inQuotes = false;
+            let i = 0;
+
+            while (i < line.length) {
+                const char = line[i];
+                const nextChar = line[i + 1];
+
+                if (char === '"') {
+                    if (inQuotes && nextChar === '"') {
+                        // Escaped quote
+                        current += '"';
+                        i += 2;
+                    } else {
+                        // Toggle quote state
+                        inQuotes = !inQuotes;
+                        i++;
+                    }
+                } else if (char === delimiter && !inQuotes) {
+                    // End of field
+                    result.push(current);
+                    current = '';
+                    i++;
+                } else {
+                    current += char;
+                    i++;
+                }
+            }
+
+            // Add the last field
+            result.push(current);
+            return result;
+        }
+
+        parseCSVTags(tagsString) {
+            if (!tagsString || typeof tagsString !== 'string') {
+                return [];
+            }
+
+            return tagsString
+                .split(/[,;|]/)
+                .map(tag => tag.trim())
+                .filter(tag => tag.length > 0);
+        }
+
+        findColumnIndex(headers, columnName) {
+            if (typeof columnName === 'number') {
+                return columnName;
+            }
+
+            const index = headers.findIndex(header =>
+                header.toLowerCase().trim() === columnName.toLowerCase().trim()
+            );
+            return index;
+        }
+
+        createBackup() {
+            try {
+                const backupData = this.exportAllData();
+                const backupKey = `ezprompt_backup_${Date.now()}`;
+
+                GM_setValue(backupKey, EZPrompt.utils.safeJsonStringify(backupData));
+
+                // Keep only last 5 backups
+                const allKeys = GM_listValues();
+                const backupKeys = allKeys
+                    .filter(key => key.startsWith('ezprompt_backup_'))
+                    .sort()
+                    .reverse();
+
+                if (backupKeys.length > 5) {
+                    for (let i = 5; i < backupKeys.length; i++) {
+                        GM_deleteValue(backupKeys[i]);
+                    }
+                }
+
+                this.logger.info(`Backup created: ${backupKey}`);
+                return backupKey;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'backup creation');
+                throw new Error('Failed to create backup: ' + error.message);
+            }
+        }
+
+        restoreFromBackup(backupKey) {
+            try {
+                const backupData = GM_getValue(backupKey);
+                if (!backupData) {
+                    throw new Error('Backup not found');
+                }
+
+                const parsedData = EZPrompt.utils.safeJsonParse(backupData);
+                if (!parsedData) {
+                    throw new Error('Invalid backup data');
+                }
+
+                // Create current backup before restore
+                this.createBackup();
+
+                // Restore data
+                const results = this.importFromJSON(parsedData, {
+                    mergeMode: 'replace',
+                    selectedTypes: ['prompts', 'categories', 'config'],
+                    conflictResolution: 'overwrite'
+                });
+
+                this.logger.info(`Restored from backup: ${backupKey}`, results);
+                return results;
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'backup restore');
+                throw new Error('Failed to restore backup: ' + error.message);
+            }
+        }
+
+        getAvailableBackups() {
+            try {
+                const allKeys = GM_listValues();
+                const backupKeys = allKeys
+                    .filter(key => key.startsWith('ezprompt_backup_'))
+                    .sort()
+                    .reverse();
+
+                return backupKeys.map(key => {
+                    const timestamp = parseInt(key.replace('ezprompt_backup_', ''));
+                    return {
+                        key,
+                        timestamp,
+                        date: new Date(timestamp).toISOString(),
+                        size: GM_getValue(key)?.length || 0
+                    };
+                });
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'backup listing');
+                return [];
+            }
+        }
+
+        async initialize() {
+            this.logger.info('Initializing StorageManager');
+
+            try {
+                // Perform schema migration
+                await this.migrateSchema();
+
+                // Initialize default data if needed
+                const categories = this.getAllCategories();
+                if (Object.keys(categories).length === 0) {
+                    const defaultCategory = this.dataModels.createCategory({
+                        id: 'default',
+                        name: 'Default'
+                    });
+                    this.saveCategory(defaultCategory);
+                    this.logger.info('Default category created');
+                }
+
+                const config = this.getUserConfig();
+                if (!config) {
+                    const defaultConfig = this.dataModels.createUserConfig();
+                    this.saveUserConfig(defaultConfig);
+                    this.logger.info('Default user config created');
+                }
+
+                this.logger.info('StorageManager initialized successfully');
+            } catch (error) {
+                this.errorHandler.handleDataError(error, 'StorageManager initialization');
+                throw error;
+            }
+        }
+    }
+
+    // Input Handler Class - Handles input detection, monitoring, and text manipulation
+    class InputHandler {
+        constructor(dependencies = {}) {
+            this.logger = dependencies.logger || EZPrompt.logger;
+            this.errorHandler = dependencies.errorHandler || EZPrompt.errorHandler;
+            this.siteDetection = dependencies.siteDetection;
+            this.storage = dependencies.storage;
+            this.uiManager = dependencies.uiManager;
+
+            // State management
+            this.currentInputElement = null;
+            this.isMonitoring = false;
+            this.mutationObserver = null;
+            this.inputObserver = null;
+            this.keyboardListeners = new Map();
+
+            // Configuration
+            this.triggerChar = '#';
+            this.debounceDelay = 300;
+            this.insertionModes = {
+                REPLACE: 'replace',
+                PREFIX: 'prefix',
+                SUFFIX: 'suffix'
+            };
+
+            // Event handlers (bound to preserve context)
+            this.handleInputChange = EZPrompt.utils.debounce(this.onInputChange.bind(this), this.debounceDelay);
+            this.handleKeyDown = this.onKeyDown.bind(this);
+            this.handleKeyUp = this.onKeyUp.bind(this);
+            this.handleFocus = this.onFocus.bind(this);
+            this.handleBlur = this.onBlur.bind(this);
+
+            // Autocomplete state
+            this.autocompleteActive = false;
+            this.triggerPosition = -1;
+            this.triggerQuery = '';
+        }
+
+        // Initialize input monitoring
+        async initialize() {
+            this.logger.info('Initializing InputHandler');
+
+            try {
+                // Start monitoring for input elements
+                await this.startInputMonitoring();
+
+                this.logger.info('InputHandler initialized successfully');
+            } catch (error) {
+                this.errorHandler.handleError(error, 'InputHandler initialization');
+                throw error;
+            }
+        }
+
+        // Start monitoring for input elements using MutationObserver
+        async startInputMonitoring() {
+            if (this.isMonitoring) {
+                this.logger.debug('Input monitoring already active');
+                return;
+            }
+
+            this.logger.debug('Starting input monitoring');
+
+            // Initial input detection
+            await this.detectAndAttachToInputs();
+
+            // Set up MutationObserver to watch for dynamic content changes
+            this.setupMutationObserver();
+
+            this.isMonitoring = true;
+        }
+
+        // Stop input monitoring and cleanup
+        stopInputMonitoring() {
+            if (!this.isMonitoring) {
+                return;
+            }
+
+            this.logger.debug('Stopping input monitoring');
+
+            // Disconnect observers
+            if (this.mutationObserver) {
+                this.mutationObserver.disconnect();
+                this.mutationObserver = null;
+            }
+
+            if (this.inputObserver) {
+                this.inputObserver.disconnect();
+                this.inputObserver = null;
+            }
+
+            // Remove event listeners
+            this.removeEventListeners();
+
+            // Clear state
+            this.currentInputElement = null;
+            this.isMonitoring = false;
+            this.autocompleteActive = false;
+        }
+
+        // Setup MutationObserver to detect dynamic input elements
+        setupMutationObserver() {
+            this.mutationObserver = new MutationObserver(EZPrompt.utils.debounce(async (mutations) => {
+                let shouldRedetect = false;
+
+                for (const mutation of mutations) {
+                    // Check for added nodes that might contain input elements
+                    if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+                        for (const node of mutation.addedNodes) {
+                            if (node.nodeType === Node.ELEMENT_NODE) {
+                                // Check if the added node or its children contain input elements
+                                if (await this.containsInputElements(node)) {
+                                    shouldRedetect = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Check for attribute changes that might affect input detection
+                    if (mutation.type === 'attributes' &&
+                        ['class', 'id', 'contenteditable', 'disabled', 'readonly'].includes(mutation.attributeName)) {
+                        shouldRedetect = true;
+                    }
+                }
+
+                if (shouldRedetect) {
+                    this.logger.debug('DOM changes detected, re-detecting input elements');
+                    await this.detectAndAttachToInputs();
+                }
+            }, 500));
+
+            // Start observing
+            this.mutationObserver.observe(document.body, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['class', 'id', 'contenteditable', 'disabled', 'readonly']
+            });
+
+            this.logger.debug('MutationObserver setup complete');
+        }
+
+        // Check if an element or its children contain input elements
+        async containsInputElements(element) {
+            if (!this.siteDetection || !this.siteDetection.currentSite) {
+                return false;
+            }
+
+            const selectors = this.siteDetection.currentSite.inputSelectors;
+
+            for (const selector of selectors) {
+                try {
+                    if (element.matches && element.matches(selector)) {
+                        return true;
+                    }
+                    if (element.querySelector && element.querySelector(selector)) {
+                        return true;
+                    }
+                } catch (error) {
+                    // Invalid selector, continue
+                }
+            }
+
+            return false;
+        }
+
+        // Detect and attach to input elements
+        async detectAndAttachToInputs() {
+            if (!this.siteDetection) {
+                this.logger.warn('SiteDetection not available for input detection');
+                return;
+            }
+
+            try {
+                const inputElement = await this.siteDetection.findInputElement();
+
+                if (inputElement && inputElement !== this.currentInputElement) {
+                    this.logger.debug('New input element detected');
+
+                    // Remove listeners from previous element
+                    this.removeEventListeners();
+
+                    // Attach to new element
+                    this.attachToInputElement(inputElement);
+                }
+            } catch (error) {
+                this.errorHandler.handleDOMError(error, 'input detection');
+            }
+        }
+
+        // Attach event listeners to an input element
+        attachToInputElement(inputElement) {
+            if (!inputElement) {
+                return;
+            }
+
+            this.logger.debug('Attaching to input element:', inputElement.tagName, inputElement.className);
+
+            // Store current element
+            this.currentInputElement = inputElement;
+
+            // Add event listeners
+            this.addEventListener(inputElement, 'input', this.handleInputChange);
+            this.addEventListener(inputElement, 'keydown', this.handleKeyDown);
+            this.addEventListener(inputElement, 'keyup', this.handleKeyUp);
+            this.addEventListener(inputElement, 'focus', this.handleFocus);
+            this.addEventListener(inputElement, 'blur', this.handleBlur);
+
+            // Add autocomplete selection listener
+            this.setupAutocompleteListeners();
+
+            // Create UI button for this input element
+            if (this.uiManager) {
+                this.uiManager.createInputButton(inputElement);
+            }
+
+            // Setup input-specific observer for attribute changes
+            this.setupInputObserver(inputElement);
+
+            this.logger.info('Successfully attached to input element');
+        }
+
+        // Setup observer for input element changes
+        setupInputObserver(inputElement) {
+            if (this.inputObserver) {
+                this.inputObserver.disconnect();
+            }
+
+            this.inputObserver = new MutationObserver((mutations) => {
+                for (const mutation of mutations) {
+                    if (mutation.type === 'attributes') {
+                        const target = mutation.target;
+
+                        // Check if element became disabled or readonly
+                        if (target.disabled || target.readOnly || target.getAttribute('contenteditable') === 'false') {
+                            this.logger.debug('Input element became unavailable, detaching');
+                            this.removeEventListeners();
+                            this.currentInputElement = null;
+                            // Try to find a new input element
+                            setTimeout(() => this.detectAndAttachToInputs(), 1000);
+                        }
+                    }
+                }
+            });
+
+            this.inputObserver.observe(inputElement, {
+                attributes: true,
+                attributeFilter: ['disabled', 'readonly', 'contenteditable']
+            });
+        }
+
+        // Add event listener with tracking
+        addEventListener(element, event, handler) {
+            element.addEventListener(event, handler);
+
+            // Track for cleanup
+            if (!this.keyboardListeners.has(element)) {
+                this.keyboardListeners.set(element, []);
+            }
+            this.keyboardListeners.get(element).push({ event, handler });
+        }
+
+        // Remove all event listeners
+        removeEventListeners() {
+            // Remove UI button if it exists
+            if (this.uiManager && this.currentInputElement) {
+                this.uiManager.removeInputButton(this.currentInputElement);
+            }
+
+            for (const [element, listeners] of this.keyboardListeners) {
+                for (const { event, handler } of listeners) {
+                    element.removeEventListener(event, handler);
+                }
+            }
+            this.keyboardListeners.clear();
+        }
+
+        // Event Handlers
+
+        // Handle input changes (debounced)
+        onInputChange(event) {
+            if (!this.currentInputElement) {
+                return;
+            }
+
+            try {
+                const inputText = this.getInputText();
+                this.logger.debug('Input changed:', inputText.substring(0, 50) + '...');
+
+                // Check for autocomplete trigger
+                this.checkAutocompleTrigger(inputText);
+
+            } catch (error) {
+                this.errorHandler.handleDOMError(error, 'input change handling');
+            }
+        }
+
+        // Handle keydown events
+        onKeyDown(event) {
+            if (!this.currentInputElement) {
+                return;
+            }
+
+            try {
+                // Handle autocomplete navigation
+                if (this.autocompleteActive) {
+                    if (this.handleAutocompleteNavigation(event)) {
+                        return; // Event was handled
+                    }
+                }
+
+                // Handle global shortcuts
+                this.handleGlobalShortcuts(event);
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'keydown handling');
+            }
+        }
+
+        // Handle keyup events
+        onKeyUp(event) {
+            // Currently not used, but available for future features
+        }
+
+        // Handle focus events
+        onFocus(event) {
+            this.logger.debug('Input element focused');
+
+            // Show UI button when input is focused
+            if (this.uiManager && this.currentInputElement) {
+                this.uiManager.setButtonVisibility(this.currentInputElement, true);
+            }
+        }
+
+        // Handle blur events
+        onBlur(event) {
+            this.logger.debug('Input element blurred');
+
+            // Hide autocomplete when input loses focus
+            if (this.autocompleteActive) {
+                this.hideAutocomplete();
+            }
+
+            // Keep button visible but slightly faded when input loses focus
+            // This allows users to still access prompts even when not actively typing
+            if (this.uiManager && this.currentInputElement) {
+                // We'll keep the button visible for better UX
+                // this.uiManager.setButtonVisibility(this.currentInputElement, false);
+            }
+        }
+
+        // Text Manipulation Methods
+
+        // Get current input text
+        getInputText() {
+            if (!this.currentInputElement) {
+                return '';
+            }
+
+            if (this.currentInputElement.tagName.toLowerCase() === 'textarea' ||
+                this.currentInputElement.tagName.toLowerCase() === 'input') {
+                return this.currentInputElement.value || '';
+            } else if (this.currentInputElement.contentEditable === 'true') {
+                return this.currentInputElement.textContent || this.currentInputElement.innerText || '';
+            }
+
+            return '';
+        }
+
+        // Set input text
+        setInputText(text) {
+            if (!this.currentInputElement) {
+                throw new Error('No input element available');
+            }
+
+            if (this.currentInputElement.tagName.toLowerCase() === 'textarea' ||
+                this.currentInputElement.tagName.toLowerCase() === 'input') {
+                this.currentInputElement.value = text;
+
+                // Trigger input event to notify other listeners
+                this.currentInputElement.dispatchEvent(new Event('input', { bubbles: true }));
+            } else if (this.currentInputElement.contentEditable === 'true') {
+                this.currentInputElement.textContent = text;
+
+                // Trigger input event
+                this.currentInputElement.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+
+            this.logger.debug('Input text set:', text.substring(0, 50) + '...');
+        }
+
+        // Set cursor position in input element
+        setCursorPosition(position) {
+            if (!this.currentInputElement) {
+                return;
+            }
+
+            try {
+                if (this.currentInputElement.tagName.toLowerCase() === 'textarea' ||
+                    this.currentInputElement.tagName.toLowerCase() === 'input') {
+
+                    // For input and textarea elements
+                    this.currentInputElement.setSelectionRange(position, position);
+                    this.currentInputElement.focus();
+
+                } else if (this.currentInputElement.contentEditable === 'true') {
+
+                    // For contenteditable elements
+                    const range = document.createRange();
+                    const selection = window.getSelection();
+
+                    // Find the text node and position
+                    const textNode = this.findTextNodeAtPosition(this.currentInputElement, position);
+                    if (textNode) {
+                        range.setStart(textNode.node, textNode.offset);
+                        range.setEnd(textNode.node, textNode.offset);
+
+                        selection.removeAllRanges();
+                        selection.addRange(range);
+                        this.currentInputElement.focus();
+                    }
+                }
+
+            } catch (error) {
+                this.errorHandler.handleDOMError(error, 'cursor positioning');
+            }
+        }
+
+        // Helper method to find text node at specific position
+        findTextNodeAtPosition(element, position) {
+            let currentPos = 0;
+
+            function traverse(node) {
+                if (node.nodeType === Node.TEXT_NODE) {
+                    const nodeLength = node.textContent.length;
+                    if (currentPos + nodeLength >= position) {
+                        return {
+                            node: node,
+                            offset: position - currentPos
+                        };
+                    }
+                    currentPos += nodeLength;
+                } else {
+                    for (let child of node.childNodes) {
+                        const result = traverse(child);
+                        if (result) return result;
+                    }
+                }
+                return null;
+            }
+
+            return traverse(element);
+        }
+
+        // Insert prompt with specified mode (async to support template processing)
+        async insertPrompt(prompt, mode = null, variables = {}) {
+            if (!prompt || !prompt.content) {
+                throw new Error('Invalid prompt data');
+            }
+
+            if (!this.currentInputElement) {
+                throw new Error('No input element available for insertion');
+            }
+
+            try {
+                // Process template variables if needed
+                let processedContent = prompt.content;
+
+                // Get prompt engine for template processing
+                const promptEngine = EZPrompt.modules?.promptEngine;
+                if (promptEngine && promptEngine.hasTemplateVariables(prompt)) {
+                    this.logger.debug('Processing template variables for prompt:', prompt.name);
+                    processedContent = await promptEngine.processPromptTemplate(prompt, variables);
+                }
+
+                // Get user config for default insertion mode
+                const config = this.storage ? this.storage.getUserConfig() : null;
+                const insertionMode = mode || (config ? config.insertion_mode : this.insertionModes.REPLACE);
+
+                const currentText = this.getInputText();
+                let newText;
+
+                switch (insertionMode) {
+                    case this.insertionModes.REPLACE:
+                        newText = processedContent;
+                        break;
+
+                    case this.insertionModes.PREFIX:
+                        newText = processedContent + (currentText ? '\n' + currentText : '');
+                        break;
+
+                    case this.insertionModes.SUFFIX:
+                        newText = (currentText ? currentText + '\n' : '') + processedContent;
+                        break;
+
+                    default:
+                        throw new Error(`Invalid insertion mode: ${insertionMode}`);
+                }
+
+                // Set the new text
+                this.setInputText(newText);
+
+                // Update prompt usage count
+                if (this.storage && prompt.id) {
+                    try {
+                        const currentPrompt = this.storage.getPrompt(prompt.id);
+                        if (currentPrompt) {
+                            this.storage.updatePrompt(prompt.id, {
+                                usage_count: (currentPrompt.usage_count || 0) + 1
+                            });
+                        }
+                    } catch (error) {
+                        this.logger.warn('Failed to update prompt usage count:', error);
+                    }
+                }
+
+                // Track statistics in UI Manager
+                if (this.uiManager && typeof this.uiManager.trackPromptInsertion === 'function') {
+                    this.uiManager.trackPromptInsertion();
+                }
+
+                this.logger.info(`Prompt inserted using ${insertionMode} mode:`, prompt.name);
+                return true;
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'prompt insertion');
+                throw error;
+            }
+        }
+
+        // Replace shortcut text with prompt content
+        replaceShortcut(shortcut, content) {
+            if (!this.currentInputElement) {
+                throw new Error('No input element available for shortcut replacement');
+            }
+
+            try {
+                const currentText = this.getInputText();
+                const shortcutIndex = currentText.lastIndexOf(shortcut);
+
+                if (shortcutIndex === -1) {
+                    this.logger.warn('Shortcut not found in current text:', shortcut);
+                    return false;
+                }
+
+                // Replace the shortcut with content
+                const newText = currentText.substring(0, shortcutIndex) +
+                    content +
+                    currentText.substring(shortcutIndex + shortcut.length);
+
+                this.setInputText(newText);
+
+                this.logger.debug('Shortcut replaced:', shortcut, '->', content.substring(0, 50) + '...');
+                return true;
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'shortcut replacement');
+                throw error;
+            }
+        }
+
+        // Autocomplete Methods
+
+        // Check for autocomplete trigger character
+        checkAutocompleTrigger(inputText) {
+            const triggerIndex = inputText.lastIndexOf(this.triggerChar);
+
+            if (triggerIndex === -1) {
+                // No trigger character found
+                if (this.autocompleteActive) {
+                    this.hideAutocomplete();
+                }
+                return;
+            }
+
+            // Check if trigger is at word boundary or start of text
+            const beforeTrigger = triggerIndex > 0 ? inputText[triggerIndex - 1] : ' ';
+            if (triggerIndex > 0 && !/\s/.test(beforeTrigger)) {
+                // Trigger character is not at word boundary
+                if (this.autocompleteActive) {
+                    this.hideAutocomplete();
+                }
+                return;
+            }
+
+            // Extract query after trigger
+            const query = inputText.substring(triggerIndex + 1);
+
+            // Check if query contains spaces (which would end autocomplete)
+            if (query.includes(' ') || query.includes('\n')) {
+                if (this.autocompleteActive) {
+                    this.hideAutocomplete();
+                }
+                return;
+            }
+
+            // Update autocomplete state
+            this.triggerPosition = triggerIndex;
+            this.triggerQuery = query;
+
+            if (!this.autocompleteActive) {
+                this.showAutocomplete(query);
+            } else {
+                this.updateAutocomplete(query);
+            }
+        }
+
+        // Show autocomplete dropdown
+        showAutocomplete(query) {
+            this.logger.debug('Showing autocomplete for query:', query);
+            this.autocompleteActive = true;
+
+            if (!this.uiManager || !this.storage) {
+                this.logger.warn('UIManager or Storage not available for autocomplete');
+                return;
+            }
+
+            try {
+                // Get all prompts
+                const allPrompts = this.storage.getAllPrompts ?
+                    Object.values(this.storage.getAllPrompts()) :
+                    (this.storage.prompts || []);
+
+                // Search for matching prompts
+                const matches = this.uiManager.fuzzySearch(query, allPrompts);
+
+                if (matches.length > 0) {
+                    // Calculate position for autocomplete panel
+                    const position = this.calculateAutocompletePosition();
+
+                    // Show autocomplete panel
+                    this.uiManager.showAutocomplete(matches, position);
+                } else {
+                    this.logger.debug('No matches found for query:', query);
+                }
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Showing autocomplete');
+            }
+        }
+
+        // Update autocomplete results
+        updateAutocomplete(query) {
+            this.logger.debug('Updating autocomplete for query:', query);
+
+            if (!this.autocompleteActive) {
+                this.showAutocomplete(query);
+                return;
+            }
+
+            // Hide current autocomplete and show new results
+            if (this.uiManager) {
+                this.uiManager.hideAutocomplete();
+            }
+
+            this.showAutocomplete(query);
+        }
+
+        // Hide autocomplete dropdown
+        hideAutocomplete() {
+            if (!this.autocompleteActive) {
+                return;
+            }
+
+            this.logger.debug('Hiding autocomplete');
+            this.autocompleteActive = false;
+            this.triggerPosition = -1;
+            this.triggerQuery = '';
+
+            if (this.uiManager) {
+                this.uiManager.hideAutocomplete();
+            }
+        }
+
+        // Calculate position for autocomplete panel
+        calculateAutocompletePosition() {
+            if (!this.currentInputElement) {
+                return { x: 100, y: 100 };
+            }
+
+            try {
+                const rect = this.currentInputElement.getBoundingClientRect();
+                const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+                const scrollLeft = window.pageXOffset || document.documentElement.scrollLeft;
+
+                // Position below the input element
+                return {
+                    x: rect.left + scrollLeft,
+                    y: rect.bottom + scrollTop + 5
+                };
+
+            } catch (error) {
+                this.errorHandler.handleDOMError(error, 'position calculation');
+                return { x: 100, y: 100 };
+            }
+        }
+
+        // Handle autocomplete navigation (arrow keys, enter, escape)
+        handleAutocompleteNavigation(event) {
+            if (!this.uiManager) {
+                return false;
+            }
+
+            switch (event.key) {
+                case 'Escape':
+                    this.hideAutocomplete();
+                    event.preventDefault();
+                    return true;
+
+                case 'ArrowUp':
+                    if (this.uiManager.navigateAutocomplete('up')) {
+                        event.preventDefault();
+                        return true;
+                    }
+                    break;
+
+                case 'ArrowDown':
+                    if (this.uiManager.navigateAutocomplete('down')) {
+                        event.preventDefault();
+                        return true;
+                    }
+                    break;
+
+                case 'Enter':
+                case 'Tab':
+                    const selectedPromptId = this.uiManager.selectAutocompleteItem();
+                    if (selectedPromptId) {
+                        // Handle async autocomplete selection
+                        this.handleAutocompleteSelection(selectedPromptId).catch(error => {
+                            this.logger.error('Failed to handle autocomplete selection:', error);
+                        });
+                        event.preventDefault();
+                        return true;
+                    }
+                    break;
+
+                default:
+                    return false;
+            }
+
+            return false;
+        }
+
+        // Setup autocomplete event listeners
+        setupAutocompleteListeners() {
+            // Listen for autocomplete selection events
+            document.addEventListener('ezprompt:autocomplete-select', (event) => {
+                this.handleAutocompleteSelection(event.detail.promptId);
+            });
+
+            // Listen for prompt panel selection events
+            document.addEventListener('ezprompt:prompt-selected', async (event) => {
+                const { prompt, inputElement } = event.detail;
+                if (inputElement === this.currentInputElement) {
+                    try {
+                        await this.insertPrompt(prompt);
+                    } catch (error) {
+                        this.logger.error('Failed to insert selected prompt:', error);
+                    }
+                }
+            });
+        }
+
+        // Handle autocomplete selection (async to support template processing)
+        async handleAutocompleteSelection(promptId) {
+            if (!promptId || !this.storage) {
+                this.logger.warn('Invalid prompt ID or storage not available');
+                return;
+            }
+
+            try {
+                // Get the selected prompt
+                const prompt = this.storage.getPrompt(promptId);
+                if (!prompt) {
+                    this.logger.warn('Prompt not found:', promptId);
+                    return;
+                }
+
+                // Process template variables if needed
+                let processedContent = prompt.content;
+
+                // Get prompt engine for template processing
+                const promptEngine = EZPrompt.modules?.promptEngine;
+                if (promptEngine && promptEngine.hasTemplateVariables(prompt)) {
+                    this.logger.debug('Processing template variables for autocomplete prompt:', prompt.name);
+                    processedContent = await promptEngine.processPromptTemplate(prompt);
+                }
+
+                // Replace the trigger text with the processed prompt content
+                this.replaceAutocompleteText(processedContent);
+
+                // Update usage count
+                if (this.storage.updatePrompt) {
+                    this.storage.updatePrompt(promptId, {
+                        usage_count: (prompt.usage_count || 0) + 1,
+                        last_used: new Date().toISOString()
+                    });
+                }
+
+                this.logger.info('Autocomplete selection completed:', prompt.name);
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Autocomplete selection');
+            }
+        }
+
+        // Replace autocomplete trigger text with prompt content
+        replaceAutocompleteText(content) {
+            if (!this.currentInputElement || this.triggerPosition === -1) {
+                this.logger.warn('Cannot replace autocomplete text: invalid state');
+                return;
+            }
+
+            try {
+                const currentText = this.getInputText();
+                const beforeTrigger = currentText.substring(0, this.triggerPosition);
+                const afterQuery = currentText.substring(this.triggerPosition + 1 + this.triggerQuery.length);
+
+                const newText = beforeTrigger + content + afterQuery;
+
+                // Set the new text
+                this.setInputText(newText);
+
+                // Position cursor after inserted content
+                const cursorPosition = beforeTrigger.length + content.length;
+                this.setCursorPosition(cursorPosition);
+
+                // Reset autocomplete state
+                this.hideAutocomplete();
+
+                this.logger.debug('Autocomplete text replaced successfully');
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Replacing autocomplete text');
+            }
+        }
+
+        // Handle global keyboard shortcuts
+        handleGlobalShortcuts(event) {
+            // Get user config for shortcuts
+            const config = this.storage ? this.storage.getUserConfig() : null;
+            const shortcuts = config ? config.shortcuts : this.getDefaultShortcuts();
+
+            // Check for open panel shortcut
+            const openPanelShortcut = shortcuts.open_panel || 'Ctrl+Shift+P';
+            if (this.matchesShortcut(event, openPanelShortcut)) {
+                this.logger.debug('Open panel shortcut triggered');
+                this.triggerPromptPanel();
+                event.preventDefault();
+                return true;
+            }
+
+            // Check for open settings shortcut
+            const openSettingsShortcut = shortcuts.open_settings || 'Ctrl+Shift+S';
+            if (this.matchesShortcut(event, openSettingsShortcut)) {
+                this.logger.debug('Open settings shortcut triggered');
+                this.triggerSettingsPanel();
+                event.preventDefault();
+                return true;
+            }
+
+            // Check for insertion mode shortcuts
+            if (shortcuts.mode_replace && this.matchesShortcut(event, shortcuts.mode_replace)) {
+                this.logger.debug('Replace mode shortcut triggered');
+                this.setInsertionMode('replace');
+                event.preventDefault();
+                return true;
+            }
+
+            if (shortcuts.mode_prefix && this.matchesShortcut(event, shortcuts.mode_prefix)) {
+                this.logger.debug('Prefix mode shortcut triggered');
+                this.setInsertionMode('prefix');
+                event.preventDefault();
+                return true;
+            }
+
+            if (shortcuts.mode_suffix && this.matchesShortcut(event, shortcuts.mode_suffix)) {
+                this.logger.debug('Suffix mode shortcut triggered');
+                this.setInsertionMode('suffix');
+                event.preventDefault();
+                return true;
+            }
+
+            // Check for quick insert shortcuts (Ctrl+1, Ctrl+2, etc.)
+            if (event.ctrlKey && !event.shiftKey && !event.altKey) {
+                const keyNum = parseInt(event.key);
+                if (keyNum >= 1 && keyNum <= 9) {
+                    this.logger.debug(`Quick insert shortcut triggered: Ctrl+${keyNum}`);
+                    this.triggerQuickInsert(keyNum - 1); // 0-based index
+                    event.preventDefault();
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        // Check if event matches a keyboard shortcut
+        matchesShortcut(event, shortcut) {
+            if (!shortcut) return false;
+
+            const parts = shortcut.split('+').map(part => part.trim().toLowerCase());
+
+            let ctrlRequired = false;
+            let shiftRequired = false;
+            let altRequired = false;
+            let key = '';
+
+            for (const part of parts) {
+                switch (part) {
+                    case 'ctrl':
+                        ctrlRequired = true;
+                        break;
+                    case 'shift':
+                        shiftRequired = true;
+                        break;
+                    case 'alt':
+                        altRequired = true;
+                        break;
+                    default:
+                        key = part;
+                        break;
+                }
+            }
+
+            return event.ctrlKey === ctrlRequired &&
+                event.shiftKey === shiftRequired &&
+                event.altKey === altRequired &&
+                event.key.toLowerCase() === key;
+        }
+
+        // Get default keyboard shortcuts
+        getDefaultShortcuts() {
+            return {
+                'open_panel': 'Ctrl+Shift+P',
+                'open_settings': 'Ctrl+Shift+S',
+                'mode_replace': 'Ctrl+Shift+R',
+                'mode_prefix': 'Ctrl+Shift+1',
+                'mode_suffix': 'Ctrl+Shift+2'
+            };
+        }
+
+        // Trigger prompt panel
+        triggerPromptPanel() {
+            if (this.uiManager && this.currentInputElement) {
+                try {
+                    // Calculate position for prompt panel
+                    const position = this.calculatePromptPanelPosition();
+                    this.uiManager.showPromptPanel(position, this.currentInputElement);
+                    this.logger.info('Prompt panel opened via keyboard shortcut');
+                } catch (error) {
+                    this.errorHandler.handleError(error, 'Opening prompt panel');
+                }
+            } else {
+                this.logger.warn('Cannot open prompt panel: UIManager or input element not available');
+            }
+        }
+
+        // Trigger settings panel
+        triggerSettingsPanel() {
+            if (this.uiManager) {
+                try {
+                    this.uiManager.showSettingsPanel();
+                    this.logger.info('Settings panel opened via keyboard shortcut');
+                } catch (error) {
+                    this.errorHandler.handleError(error, 'Opening settings panel');
+                }
+            } else {
+                this.logger.warn('Cannot open settings panel: UIManager not available');
+            }
+        }
+
+        // Calculate position for prompt panel
+        calculatePromptPanelPosition() {
+            if (!this.currentInputElement) {
+                return { x: 100, y: 100 };
+            }
+
+            try {
+                const rect = this.currentInputElement.getBoundingClientRect();
+                const scrollTop = window.pageYOffset || document.documentElement.scrollTop;
+                const scrollLeft = window.pageXOffset || document.documentElement.scrollLeft;
+
+                // Position to the right of the input element
+                return {
+                    x: rect.right + scrollLeft + 10,
+                    y: rect.top + scrollTop
+                };
+
+            } catch (error) {
+                this.errorHandler.handleDOMError(error, 'prompt panel position calculation');
+                return { x: 100, y: 100 };
+            }
+        }
+
+        // Set insertion mode and persist it
+        setInsertionMode(mode) {
+            if (!Object.values(this.insertionModes).includes(mode)) {
+                this.logger.warn(`Invalid insertion mode: ${mode}`);
+                return false;
+            }
+
+            try {
+                // Update user config
+                if (this.storage) {
+                    this.storage.updateUserConfig({ insertion_mode: mode });
+                    this.logger.info(`Insertion mode changed to: ${mode}`);
+
+                    // Show notification to user
+                    this.showModeNotification(mode);
+                    return true;
+                } else {
+                    this.logger.warn('Storage not available for mode persistence');
+                    return false;
+                }
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Setting insertion mode');
+                return false;
+            }
+        }
+
+        // Show mode change notification
+        showModeNotification(mode) {
+            try {
+                // Create a temporary notification element
+                const notification = document.createElement('div');
+                notification.style.cssText = `
+                    position: fixed;
+                    top: 20px;
+                    right: 20px;
+                    background: #333;
+                    color: white;
+                    padding: 10px 15px;
+                    border-radius: 5px;
+                    font-size: 14px;
+                    z-index: 10000;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+                    transition: opacity 0.3s ease;
+                `;
+
+                const modeNames = {
+                    'replace': 'Replace Mode',
+                    'prefix': 'Prefix Mode',
+                    'suffix': 'Suffix Mode'
+                };
+
+                notification.textContent = `EZPrompt: ${modeNames[mode] || mode}`;
+                document.body.appendChild(notification);
+
+                // Auto-remove after 2 seconds
+                setTimeout(() => {
+                    notification.style.opacity = '0';
+                    setTimeout(() => {
+                        if (notification.parentNode) {
+                            notification.parentNode.removeChild(notification);
+                        }
+                    }, 300);
+                }, 2000);
+
+            } catch (error) {
+                this.logger.warn('Failed to show mode notification:', error);
+            }
+        }
+
+        // Trigger quick insert for frequently used prompts
+        triggerQuickInsert(index) {
+            if (!this.storage) {
+                this.logger.warn('Storage not available for quick insert');
+                return;
+            }
+
+            try {
+                // Get most frequently used prompts
+                const allPrompts = Object.values(this.storage.getAllPrompts() || {});
+                const sortedPrompts = allPrompts
+                    .filter(prompt => prompt && prompt.usage_count > 0)
+                    .sort((a, b) => (b.usage_count || 0) - (a.usage_count || 0));
+
+                if (index < sortedPrompts.length) {
+                    const prompt = sortedPrompts[index];
+                    this.logger.info(`Quick inserting prompt ${index + 1}: ${prompt.name}`);
+
+                    // Insert the prompt asynchronously
+                    this.insertPrompt(prompt).catch(error => {
+                        this.logger.error('Failed to quick insert prompt:', error);
+                    });
+                } else {
+                    this.logger.debug(`No prompt available for quick insert index: ${index + 1}`);
+                }
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Quick insert');
+            }
+        }
+
+        // Get current insertion mode
+        getCurrentInsertionMode() {
+            const config = this.storage ? this.storage.getUserConfig() : null;
+            return config ? config.insertion_mode : this.insertionModes.REPLACE;
+        }
+
+        // Update keyboard shortcuts configuration
+        updateShortcuts(shortcuts) {
+            if (!this.storage) {
+                throw new Error('Storage not available for shortcut configuration');
+            }
+
+            try {
+                // Validate shortcuts format
+                const validatedShortcuts = this.validateShortcuts(shortcuts);
+
+                // Update user config
+                const currentConfig = this.storage.getUserConfig() || {};
+                const updatedConfig = {
+                    ...currentConfig,
+                    shortcuts: { ...currentConfig.shortcuts, ...validatedShortcuts }
+                };
+
+                this.storage.saveUserConfig(updatedConfig);
+                this.logger.info('Keyboard shortcuts updated');
+                return true;
+
+            } catch (error) {
+                this.errorHandler.handleError(error, 'Updating shortcuts');
+                throw error;
+            }
+        }
+
+        // Validate shortcuts format
+        validateShortcuts(shortcuts) {
+            const validated = {};
+            const validKeys = ['open_panel', 'mode_replace', 'mode_prefix', 'mode_suffix'];
+
+            for (const [key, shortcut] of Object.entries(shortcuts)) {
+                if (!validKeys.includes(key)) {
+                    this.logger.warn(`Invalid shortcut key: ${key}`);
+                    continue;
+                }
+
+                if (typeof shortcut !== 'string' || !shortcut.trim()) {
+                    this.logger.warn(`Invalid shortcut value for ${key}: ${shortcut}`);
+                    continue;
+                }
+
+                // Basic validation of shortcut format
+                if (!/^(Ctrl\+|Shift\+|Alt\+)*[a-zA-Z0-9]$/.test(shortcut)) {
+                    this.logger.warn(`Invalid shortcut format for ${key}: ${shortcut}`);
+                    continue;
+                }
+
+                validated[key] = shortcut;
+            }
+
+            return validated;
+        }
+
+        // Public API Methods
+
+        // Get current input element
+        getCurrentInputElement() {
+            return this.currentInputElement;
+        }
+
+        // Check if monitoring is active
+        isMonitoringActive() {
+            return this.isMonitoring;
+        }
+
+        // Get autocomplete state
+        getAutocompleteState() {
+            return {
+                active: this.autocompleteActive,
+                position: this.triggerPosition,
+                query: this.triggerQuery
+            };
+        }
+
+        // Manual trigger for prompt insertion (for UI components)
+        async insertPromptById(promptId, mode = null, variables = {}) {
+            if (!this.storage) {
+                throw new Error('Storage not available');
+            }
+
+            const prompt = this.storage.getPrompt(promptId);
+            if (!prompt) {
+                throw new Error(`Prompt not found: ${promptId}`);
+            }
+
+            return this.insertPrompt(prompt, mode, variables);
+        }
+
+        // Get available keyboard shortcuts
+        getKeyboardShortcuts() {
+            const config = this.storage ? this.storage.getUserConfig() : null;
+            const shortcuts = config ? config.shortcuts : this.getDefaultShortcuts();
+            return { ...this.getDefaultShortcuts(), ...shortcuts };
+        }
+
+        // Get available insertion modes
+        getInsertionModes() {
+            return { ...this.insertionModes };
+        }
+
+        // Set insertion mode programmatically
+        setInsertionModeAPI(mode) {
+            return this.setInsertionMode(mode);
+        }
+
+        // Update shortcuts programmatically
+        updateShortcutsAPI(shortcuts) {
+            return this.updateShortcuts(shortcuts);
+        }
+
+        // Cleanup method
+        cleanup() {
+            this.logger.debug('Cleaning up InputHandler');
+            this.stopInputMonitoring();
+        }
+    }
+
+    // WebDAV Client Class
+    class WebDAVClient {
+        constructor(dependencies = {}) {
+            this.logger = dependencies.logger || EZPrompt.logger;
+            this.errorHandler = dependencies.errorHandler || EZPrompt.errorHandler;
+            this.config = null;
+            this.timeout = 10000; // 10 seconds
+            this.retryAttempts = 3;
+        }
+
+        // Configure WebDAV connection
+        configure(config) {
+            if (!config || !config.url || !config.username || !config.password) {
+                throw new Error('Invalid WebDAV configuration: missing required fields');
+            }
+
+            // Ensure URL ends with /
+            const url = config.url.endsWith('/') ? config.url : config.url + '/';
+
+            this.config = {
+                url,
+                username: config.username,
+                password: config.password,
+                timeout: config.timeout || this.timeout
+            };
+
+            this.logger.info('WebDAV client configured');
+        }
+
+        // Test connection to WebDAV server
+        async testConnection() {
+            if (!this.config) {
+                throw new Error('WebDAV client not configured');
+            }
+
+            try {
+                this.logger.debug('Testing WebDAV connection');
+
+                const response = await this.makeRequest('PROPFIND', '', {
+                    'Depth': '0',
+                    'Content-Type': 'application/xml'
+                }, '<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><prop><resourcetype/></prop></propfind>');
+
+                if (response.status >= 200 && response.status < 300) {
+                    this.logger.info('WebDAV connection test successful');
+                    return { success: true, status: response.status, online: true };
+                } else {
+                    throw new Error(`Connection test failed with status: ${response.status}`);
+                }
+            } catch (error) {
+                this.logger.error('WebDAV connection test failed:', error);
+                return { success: false, error: error.message, online: false };
+            }
+        }
+
+        // Create directory if it doesn't exist
+        async ensureDirectory(path) {
+            try {
+                // Check if directory exists
+                const exists = await this.exists(path);
+                if (exists) {
+                    return true;
+                }
+
+                // Create directory
+                const response = await this.makeRequest('MKCOL', path);
+
+                if (response.status === 201 || response.status === 405) { // 405 means already exists
+                    this.logger.debug(`Directory ensured: ${path}`);
+                    return true;
+                } else {
+                    throw new Error(`Failed to create directory: ${response.status}`);
+                }
+            } catch (error) {
+                this.errorHandler.handleNetworkError(error, `ensureDirectory: ${path}`);
+                throw error;
+            }
+        }
+
+        // Check if file/directory exists
+        async exists(path) {
+            try {
+                const response = await this.makeRequest('HEAD', path);
+                return response.status >= 200 && response.status < 300;
+            } catch (error) {
+                return false;
+            }
+        }
+
+        // Upload file content
+        async put(path, content, contentType = 'application/json') {
+            try {
+                this.logger.debug(`Uploading file: ${path}`);
+
+                const response = await this.makeRequest('PUT', path, {
+                    'Content-Type': contentType
+                }, content);
+
+                if (response.status >= 200 && response.status < 300) {
+                    this.logger.debug(`File uploaded successfully: ${path}`);
+                    return { success: true, status: response.status };
+                } else {
+                    throw new Error(`Upload failed with status: ${response.status}`);
+                }
+            } catch (error) {
+                this.errorHandler.handleNetworkError(error, `put: ${path}`);
+                throw error;
+            }
+        }
+
+        // Download file content
+        async get(path) {
+            try {
+                this.logger.debug(`Downloading file: ${path}`);
+
+                const response = await this.makeRequest('GET', path);
+
+                if (response.status >= 200 && response.status < 300) {
+                    this.logger.debug(`File downloaded successfully: ${path}`);
+                    return {
+                        success: true,
+                        content: response.responseText,
+                        lastModified: response.getResponseHeader('Last-Modified'),
+                        etag: response.getResponseHeader('ETag')
+                    };
+                } else if (response.status === 404) {
+                    return { success: false, notFound: true };
+                } else {
+                    throw new Error(`Download failed with status: ${response.status}`);
+                }
+            } catch (error) {
+                this.errorHandler.handleNetworkError(error, `get: ${path}`);
+                throw error;
+            }
+        }
+
+        // Delete file
+        async delete(path) {
+            try {
+                this.logger.debug(`Deleting file: ${path}`);
+
+                const response = await this.makeRequest('DELETE', path);
+
+                if (response.status >= 200 && response.status < 300 || response.status === 404) {
+                    this.logger.debug(`File deleted successfully: ${path}`);
+                    return { success: true, status: response.status };
+                } else {
+                    throw new Error(`Delete failed with status: ${response.status}`);
+                }
+            } catch (error) {
+                this.errorHandler.handleNetworkError(error, `delete: ${path}`);
+                throw error;
+            }
+        }
+
+        // List directory contents
+        async list(path = '') {
+            try {
+                this.logger.debug(`Listing directory: ${path}`);
+
+                const propfindXml = '<?xml version="1.0" encoding="utf-8"?>' +
+                    '<propfind xmlns="DAV:">' +
+                    '<prop>' +
+                    '<resourcetype/>' +
+                    '<getlastmodified/>' +
+                    '<getcontentlength/>' +
+                    '<displayname/>' +
+                    '</prop>' +
+                    '</propfind>';
+
+                const response = await this.makeRequest('PROPFIND', path, {
+                    'Depth': '1',
+                    'Content-Type': 'application/xml'
+                }, propfindXml);
+
+                if (response.status >= 200 && response.status < 300) {
+                    const files = this.parseWebDAVResponse(response.responseText);
+                    this.logger.debug(`Directory listed successfully: ${path}, ${files.length} items`);
+                    return { success: true, files };
+                } else {
+                    throw new Error(`List failed with status: ${response.status}`);
+                }
+            } catch (error) {
+                this.errorHandler.handleNetworkError(error, `list: ${path}`);
+                throw error;
+            }
+        }
+
+        // Parse WebDAV PROPFIND response
+        parseWebDAVResponse(xmlText) {
+            try {
+                const parser = new DOMParser();
+                const xmlDoc = parser.parseFromString(xmlText, 'text/xml');
+                const responses = xmlDoc.getElementsByTagName('response');
+                const files = [];
+
+                for (let i = 0; i < responses.length; i++) {
+                    const response = responses[i];
+                    const href = response.getElementsByTagName('href')[0]?.textContent;
+                    const resourceType = response.getElementsByTagName('resourcetype')[0];
+                    const lastModified = response.getElementsByTagName('getlastmodified')[0]?.textContent;
+                    const contentLength = response.getElementsByTagName('getcontentlength')[0]?.textContent;
+                    const displayName = response.getElementsByTagName('displayname')[0]?.textContent;
+
+                    if (href) {
+                        const isDirectory = resourceType && resourceType.getElementsByTagName('collection').length > 0;
+                        const fileName = displayName || decodeURIComponent(href.split('/').pop());
+
+                        if (fileName && fileName !== '') {
+                            files.push({
+                                name: fileName,
+                                path: href,
+                                isDirectory,
+                                lastModified: lastModified ? new Date(lastModified) : null,
+                                size: contentLength ? parseInt(contentLength) : 0
+                            });
+                        }
+                    }
+                }
+
+                return files;
+            } catch (error) {
+                this.logger.error('Failed to parse WebDAV response:', error);
+                return [];
+            }
+        }
+
+        // Make HTTP request with retry logic
+        async makeRequest(method, path, headers = {}, body = null) {
+            if (!this.config) {
+                throw new Error('WebDAV client not configured');
+            }
+
+            const url = this.config.url + path;
+            const auth = btoa(`${this.config.username}:${this.config.password}`);
+
+            const requestHeaders = {
+                'Authorization': `Basic ${auth}`,
+                ...headers
+            };
+
+            let lastError;
+
+            for (let attempt = 1; attempt <= this.retryAttempts; attempt++) {
+                try {
+                    this.logger.debug(`WebDAV request attempt ${attempt}: ${method} ${url}`);
+
+                    const response = await new Promise((resolve, reject) => {
+                        GM_xmlhttpRequest({
+                            method,
+                            url,
+                            headers: requestHeaders,
+                            data: body,
+                            timeout: this.config.timeout,
+                            onload: resolve,
+                            onerror: reject,
+                            ontimeout: () => reject(new Error('Request timeout'))
+                        });
+                    });
+
+                    return response;
+                } catch (error) {
+                    lastError = error;
+                    this.logger.warn(`WebDAV request attempt ${attempt} failed:`, error);
+
+                    if (attempt < this.retryAttempts) {
+                        // Exponential backoff
+                        const delay = Math.pow(2, attempt - 1) * 1000;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                    }
+                }
+            }
+
+            throw lastError;
+        }
+
+        // Get file metadata
+        async getMetadata(path) {
+            try {
+                const propfindXml = '<?xml version="1.0" encoding="utf-8"?>' +
+                    '<propfind xmlns="DAV:">' +
+                    '<prop>' +
+                    '<getlastmodified/>' +
+                    '<getcontentlength/>' +
+                    '<getetag/>' +
+                    '</prop>' +
+                    '</propfind>';
+
+                const response = await this.makeRequest('PROPFIND', path, {
+                    'Depth': '0',
+                    'Content-Type': 'application/xml'
+                }, propfindXml);
+
+                if (response.status >= 200 && response.status < 300) {
+                    const files = this.parseWebDAVResponse(response.responseText);
+                    return files.length > 0 ? files[0] : null;
+                } else if (response.status === 404) {
+                    return null;
+                } else {
+                    throw new Error(`Get metadata failed with status: ${response.status}`);
+                }
+            } catch (error) {
+                this.errorHandler.handleNetworkError(error, `getMetadata: ${path}`);
+                throw error;
+            }
+        }
+    }
+
+    // Sync Manager Class
+    class SyncManager {
+        constructor(dependencies = {}) {
+            this.logger = dependencies.logger || EZPrompt.logger;
+            this.errorHandler = dependencies.errorHandler || EZPrompt.errorHandler;
+            this.storage = dependencies.storage;
+            this.webdavClient = new WebDAVClient(dependencies);
+
+            this.syncInterval = null;
+            this.syncInProgress = false;
+            this.lastSyncTime = null;
+            this.syncStatus = 'idle'; // idle, syncing, error, success, offline
+            this.syncError = null;
+            this.isOnline = true;
+            this.offlineMode = false;
+
+            // Default sync settings
+            this.defaultSyncInterval = 5 * 60 * 1000; // 5 minutes
+            this.syncPath = 'ezprompt/';
+            this.dataFileName = 'data.json';
+            this.metadataFileName = 'metadata.json';
+
+            // Conflict resolution strategies
+            this.conflictStrategies = {
+                LOCAL_WINS: 'local_wins',
+                REMOTE_WINS: 'remote_wins',
+                MERGE: 'merge',
+                ASK_USER: 'ask_user'
+            };
+        }
+
+        // Initialize sync manager
+        async initialize() {
+            this.logger.info('Initializing SyncManager');
+
+            // Load sync configuration
+            const config = this.storage.getUserConfig();
+            if (config && config.webdav_config && config.auto_sync) {
+                try {
+                    await this.configure(config.webdav_config);
+                    if (config.auto_sync) {
+                        this.startAutoSync(config.sync_interval);
+                    }
+                } catch (error) {
+                    this.logger.error('Failed to initialize sync with saved config:', error);
+                    this.setSyncStatus('error', error.message);
+                }
+            }
+
+            this.logger.info('SyncManager initialized');
+        }
+
+        // Configure WebDAV connection
+        async configure(webdavConfig) {
+            try {
+                this.webdavClient.configure(webdavConfig);
+
+                // Test connection
+                const testResult = await this.webdavClient.testConnection();
+                if (!testResult.success) {
+                    throw new Error(testResult.error);
+                }
+
+                // Ensure sync directory exists
+                await this.webdavClient.ensureDirectory(this.syncPath);
+
+                this.logger.info('Sync manager configured successfully');
+                this.setSyncStatus('idle');
+                return true;
+            } catch (error) {
+                this.logger.error('Failed to configure sync manager:', error);
+                this.setSyncStatus('error', error.message);
+                throw error;
+            }
+        }
+
+        // Start automatic synchronization
+        startAutoSync(interval = null) {
+            if (this.syncInterval) {
+                this.stopAutoSync();
+            }
+
+            const syncInterval = interval || this.defaultSyncInterval;
+            this.logger.info(`Starting auto sync with interval: ${syncInterval}ms`);
+
+            this.syncInterval = setInterval(async () => {
+                try {
+                    // Check online status before attempting sync
+                    const isOnline = await this.checkOnlineStatus();
+                    if (isOnline) {
+                        await this.performSync();
+                    } else {
+                        this.logger.debug('Auto sync skipped: offline mode');
+                    }
+                } catch (error) {
+                    this.logger.error('Auto sync failed:', error);
+                }
+            }, syncInterval);
+        }
+
+        // Stop automatic synchronization
+        stopAutoSync() {
+            if (this.syncInterval) {
+                clearInterval(this.syncInterval);
+                this.syncInterval = null;
+                this.logger.info('Auto sync stopped');
+            }
+        }
+
+        // Check if online and update status
+        async checkOnlineStatus() {
+            try {
+                const testResult = await this.webdavClient.testConnection();
+                this.isOnline = testResult.success;
+
+                if (!this.isOnline && !this.offlineMode) {
+                    this.logger.info('Network connection unavailable, switching to offline mode');
+                    this.offlineMode = true;
+                    this.setSyncStatus('offline', 'Network connection unavailable, using local cache');
+                } else if (this.isOnline && this.offlineMode) {
+                    this.logger.info('Network connection restored, switching to online mode');
+                    this.offlineMode = false;
+                    this.setSyncStatus('idle');
+                }
+
+                return this.isOnline;
+            } catch (error) {
+                this.isOnline = false;
+                this.offlineMode = true;
+                this.setSyncStatus('offline', 'Network connection unavailable, using local cache');
+                return false;
+            }
+        }
+
+        // Perform synchronization
+        async performSync(strategy = this.conflictStrategies.MERGE) {
+            if (this.syncInProgress) {
+                this.logger.warn('Sync already in progress, skipping');
+                return { success: false, message: 'Sync already in progress' };
+            }
+
+            // Check online status first
+            const isOnline = await this.checkOnlineStatus();
+            if (!isOnline) {
+                this.logger.info('Offline mode: sync skipped, using local cache');
+                return {
+                    success: true,
+                    message: 'Offline mode: using local cache',
+                    offline: true
+                };
+            }
+
+            try {
+                this.syncInProgress = true;
+                this.setSyncStatus('syncing');
+                this.logger.info('Starting synchronization');
+
+                // Get local data
+                const localData = this.storage.exportData();
+                const localMetadata = {
+                    lastModified: new Date().toISOString(),
+                    version: localData.version,
+                    checksum: this.calculateChecksum(localData)
+                };
+
+                // Check if remote data exists
+                const remoteDataPath = this.syncPath + this.dataFileName;
+                const remoteMetadataPath = this.syncPath + this.metadataFileName;
+
+                const remoteDataResult = await this.webdavClient.get(remoteDataPath);
+                const remoteMetadataResult = await this.webdavClient.get(remoteMetadataPath);
+
+                let syncResult;
+
+                if (remoteDataResult.notFound) {
+                    // First sync - upload local data
+                    syncResult = await this.uploadData(localData, localMetadata);
+                } else {
+                    // Compare and resolve conflicts
+                    const remoteData = EZPrompt.utils.safeJsonParse(remoteDataResult.content);
+                    const remoteMetadata = remoteMetadataResult.notFound ?
+                        null : EZPrompt.utils.safeJsonParse(remoteMetadataResult.content);
+
+                    syncResult = await this.resolveConflicts(localData, localMetadata, remoteData, remoteMetadata, strategy);
+                }
+
+                this.lastSyncTime = new Date();
+                this.setSyncStatus('success');
+                this.logger.info('Synchronization completed successfully');
+
+                return { success: true, result: syncResult };
+
+            } catch (error) {
+                this.logger.error('Synchronization failed:', error);
+                this.setSyncStatus('error', error.message);
+                return { success: false, error: error.message };
+            } finally {
+                this.syncInProgress = false;
+            }
+        }
+
+        // Upload local data to remote
+        async uploadData(localData, localMetadata) {
+            const dataPath = this.syncPath + this.dataFileName;
+            const metadataPath = this.syncPath + this.metadataFileName;
+
+            await this.webdavClient.put(dataPath, EZPrompt.utils.safeJsonStringify(localData));
+            await this.webdavClient.put(metadataPath, EZPrompt.utils.safeJsonStringify(localMetadata));
+
+            this.logger.info('Local data uploaded to remote');
+            return { action: 'upload', uploaded: true };
+        }
+
+        // Download remote data to local
+        async downloadData(remoteData, remoteMetadata) {
+            const importResult = this.storage.importData(remoteData, { overwrite: true });
+
+            this.logger.info('Remote data downloaded to local');
+            return { action: 'download', imported: importResult };
+        }
+
+        // Resolve conflicts between local and remote data
+        async resolveConflicts(localData, localMetadata, remoteData, remoteMetadata, strategy) {
+            // Compare timestamps
+            const localTime = new Date(localMetadata.lastModified);
+            const remoteTime = remoteMetadata ? new Date(remoteMetadata.lastModified) : new Date(0);
+
+            this.logger.debug(`Conflict resolution - Local: ${localTime.toISOString()}, Remote: ${remoteTime.toISOString()}`);
+
+            switch (strategy) {
+                case this.conflictStrategies.LOCAL_WINS:
+                    return await this.uploadData(localData, localMetadata);
+
+                case this.conflictStrategies.REMOTE_WINS:
+                    return await this.downloadData(remoteData, remoteMetadata);
+
+                case this.conflictStrategies.MERGE:
+                    return await this.mergeData(localData, localMetadata, remoteData, remoteMetadata);
+
+                case this.conflictStrategies.ASK_USER:
+                    try {
+                        let choice = 'merge';
+                        if (typeof window !== 'undefined') {
+                            const msg = 'EZPrompt sync conflict detected.\nChoose OK = Merge, Cancel = Keep Newest (auto).';
+                            const ok = window.confirm(msg);
+                            choice = ok ? 'merge' : (localTime > remoteTime ? 'local' : 'remote');
+                        }
+                        if (choice === 'merge') return await this.mergeData(localData, localMetadata, remoteData, remoteMetadata);
+                        if (choice === 'local') return await this.uploadData(localData, localMetadata);
+                        if (choice === 'remote') return await this.downloadData(remoteData, remoteMetadata);
+                        return await this.mergeData(localData, localMetadata, remoteData, remoteMetadata);
+                    } catch (e) {
+                        this.logger.warn('ASK_USER resolution failed, falling back to merge');
+                        return await this.mergeData(localData, localMetadata, remoteData, remoteMetadata);
+                    }
+
+                default:
+                    // Auto-resolve based on timestamps
+                    if (localTime > remoteTime) {
+                        return await this.uploadData(localData, localMetadata);
+                    } else {
+                        return await this.downloadData(remoteData, remoteMetadata);
+                    }
+            }
+        }
+
+        // Merge local and remote data
+        async mergeData(localData, localMetadata, remoteData, remoteMetadata) {
+            try {
+                const mergedData = {
+                    version: Math.max(localData.version || 1, remoteData.version || 1),
+                    exported_at: new Date().toISOString(),
+                    prompts: {},
+                    categories: {},
+                    config: localData.config || remoteData.config,
+                    variable_history: { ...remoteData.variable_history, ...localData.variable_history }
+                };
+
+                // Merge prompts (local wins on conflicts)
+                const allPrompts = { ...remoteData.prompts, ...localData.prompts };
+                for (const [id, prompt] of Object.entries(allPrompts)) {
+                    const localPrompt = localData.prompts[id];
+                    const remotePrompt = remoteData.prompts[id];
+
+                    if (localPrompt && remotePrompt) {
+                        // Conflict - use most recently updated
+                        const localTime = new Date(localPrompt.updated_at || localPrompt.created_at);
+                        const remoteTime = new Date(remotePrompt.updated_at || remotePrompt.created_at);
+                        mergedData.prompts[id] = localTime >= remoteTime ? localPrompt : remotePrompt;
+                    } else {
+                        mergedData.prompts[id] = localPrompt || remotePrompt;
+                    }
+                }
+
+                // Merge categories (local wins on conflicts)
+                const allCategories = { ...remoteData.categories, ...localData.categories };
+                for (const [id, category] of Object.entries(allCategories)) {
+                    const localCategory = localData.categories[id];
+                    const remoteCategory = remoteData.categories[id];
+
+                    if (localCategory && remoteCategory) {
+                        // Conflict - use most recently updated
+                        const localTime = new Date(localCategory.updated_at || localCategory.created_at);
+                        const remoteTime = new Date(remoteCategory.updated_at || remoteCategory.created_at);
+                        mergedData.categories[id] = localTime >= remoteTime ? localCategory : remoteCategory;
+                    } else {
+                        mergedData.categories[id] = localCategory || remoteCategory;
+                    }
+                }
+
+                // Import merged data locally
+                const importResult = this.storage.importData(mergedData, { overwrite: true });
+
+                // Upload merged data to remote
+                const mergedMetadata = {
+                    lastModified: new Date().toISOString(),
+                    version: mergedData.version,
+                    checksum: this.calculateChecksum(mergedData)
+                };
+
+                await this.uploadData(mergedData, mergedMetadata);
+
+                this.logger.info('Data merged successfully');
+                return {
+                    action: 'merge',
+                    imported: importResult,
+                    uploaded: true,
+                    conflicts: {
+                        prompts: Object.keys(localData.prompts).filter(id => remoteData.prompts[id]),
+                        categories: Object.keys(localData.categories).filter(id => remoteData.categories[id])
+                    }
+                };
+
+            } catch (error) {
+                this.logger.error('Failed to merge data:', error);
+                throw error;
+            }
+        }
+
+        // Calculate data checksum for integrity verification
+        calculateChecksum(data) {
+            try {
+                const str = EZPrompt.utils.safeJsonStringify(data);
+                let hash = 0;
+                for (let i = 0; i < str.length; i++) {
+                    const char = str.charCodeAt(i);
+                    hash = ((hash << 5) - hash) + char;
+                    hash = hash & hash; // Convert to 32-bit integer
+                }
+                return hash.toString(36);
+            } catch (error) {
+                this.logger.error('Failed to calculate checksum:', error);
+                return 'unknown';
+            }
+        }
+
+        // Set sync status and notify listeners
+        setSyncStatus(status, error = null) {
+            this.syncStatus = status;
+            this.syncError = error;
+
+            // Emit status change event (for UI updates)
+            if (typeof window !== 'undefined') {
+                window.dispatchEvent(new CustomEvent('ezprompt-sync-status', {
+                    detail: { status, error, lastSync: this.lastSyncTime }
+                }));
+            }
+        }
+
+        // Get current sync status
+        getSyncStatus() {
+            return {
+                status: this.syncStatus,
+                error: this.syncError,
+                lastSync: this.lastSyncTime,
+                inProgress: this.syncInProgress,
+                autoSyncEnabled: !!this.syncInterval,
+                isOnline: this.isOnline,
+                offlineMode: this.offlineMode
+            };
+        }
+
+        // Check if currently in offline mode
+        isOfflineMode() {
+            return this.offlineMode;
+        }
+
+        // Force online mode check
+        async forceOnlineCheck() {
+            return await this.checkOnlineStatus();
+        }
+
+        // Force sync now
+        async syncNow(strategy = null) {
+            return await this.performSync(strategy);
+        }
+
+        // Enable/disable auto sync
+        async setAutoSync(enabled, interval = null) {
+            const config = this.storage.getUserConfig() || {};
+            config.auto_sync = enabled;
+            if (interval) {
+                config.sync_interval = interval;
+            }
+
+            this.storage.saveUserConfig(config);
+
+            if (enabled) {
+                this.startAutoSync(interval);
+            } else {
+                this.stopAutoSync();
+            }
+
+            this.logger.info(`Auto sync ${enabled ? 'enabled' : 'disabled'}`);
+        }
+
+        // Update WebDAV configuration
+        async updateWebDAVConfig(webdavConfig) {
+            try {
+                await this.configure(webdavConfig);
+
+                const config = this.storage.getUserConfig() || {};
+                config.webdav_config = webdavConfig;
+                this.storage.saveUserConfig(config);
+
+                this.logger.info('WebDAV configuration updated');
+                return true;
+            } catch (error) {
+                this.logger.error('Failed to update WebDAV config:', error);
+                throw error;
+            }
+        }
+
+        // Get available conflict resolution strategies
+        getConflictStrategies() {
+            return { ...this.conflictStrategies };
+        }
+
+        // Cleanup
+        cleanup() {
+            this.stopAutoSync();
+            this.setSyncStatus('idle');
+            this.logger.debug('SyncManager cleaned up');
+        }
+    }
+
+    // Memory management and cleanup utilities
+    class MemoryManager {
+        constructor(logger) {
+            // Fallback logger to avoid runtime errors if constructed early
+            this.logger = logger || {
+                debug: () => { },
+                info: console.log.bind(console, '[EZPrompt]'),
+                warn: console.warn.bind(console, '[EZPrompt]'),
+                error: console.error.bind(console, '[EZPrompt]')
+            };
+            this.cleanupInterval = null;
+            this.memoryThreshold = 50 * 1024 * 1024; // 50MB threshold
+            this.setupMemoryMonitoring();
+        }
+
+        setupMemoryMonitoring() {
+            // Clean up caches periodically
+            this.cleanupInterval = setInterval(() => {
+                this.performCleanup();
+            }, 5 * 60 * 1000); // Every 5 minutes
+
+            EZPrompt.cleanup.intervals.add(this.cleanupInterval);
+
+            // Clean up on page unload
+            window.addEventListener('beforeunload', () => {
+                this.cleanup();
+            });
+
+            // Monitor memory usage if available
+            if ('memory' in performance) {
+                setInterval(() => {
+                    this.checkMemoryUsage();
+                }, 30000); // Every 30 seconds
+            }
+        }
+
+        performCleanup() {
+            this.logger.debug('Performing periodic cleanup');
+
+            // Clean expired cache entries
+            this.cleanExpiredCacheEntries();
+
+            // Clean up DOM element references for removed elements
+            this.cleanupDOMReferences();
+
+            // Limit cache sizes
+            this.limitCacheSizes();
+
+            // Clean up event listeners for removed elements
+            this.cleanupEventListeners();
+        }
+
+        cleanExpiredCacheEntries() {
+            const now = Date.now();
+            const maxAge = 10 * 60 * 1000; // 10 minutes
+
+            // Clean selector validation cache
+            for (const [key, value] of EZPrompt.cache.selectorValidation.entries()) {
+                if (now - value.timestamp > maxAge) {
+                    EZPrompt.cache.selectorValidation.delete(key);
+                }
+            }
+
+            // Clean search results cache
+            for (const [key, value] of EZPrompt.cache.searchResults.entries()) {
+                if (now - value.timestamp > maxAge) {
+                    EZPrompt.cache.searchResults.delete(key);
+                }
+            }
+        }
+
+        cleanupDOMReferences() {
+            // Clean up WeakMap entries for removed DOM elements
+            // WeakMap automatically handles this, but we can clean up related data
+            const elementsToRemove = [];
+
+            for (const [element, data] of EZPrompt.cache.domElements.entries()) {
+                if (!document.contains(element)) {
+                    elementsToRemove.push(element);
+                }
+            }
+
+            elementsToRemove.forEach(element => {
+                EZPrompt.cache.domElements.delete(element);
+            });
+
+            if (elementsToRemove.length > 0) {
+                this.logger.debug(`Cleaned up ${elementsToRemove.length} DOM references`);
+            }
+        }
+
+        limitCacheSizes() {
+            const maxCacheSize = 1000;
+
+            // Limit search results cache
+            if (EZPrompt.cache.searchResults.size > maxCacheSize) {
+                const entries = Array.from(EZPrompt.cache.searchResults.entries());
+                entries.sort((a, b) => a[1].timestamp - b[1].timestamp);
+
+                const toRemove = entries.slice(0, entries.length - maxCacheSize);
+                toRemove.forEach(([key]) => {
+                    EZPrompt.cache.searchResults.delete(key);
+                });
+            }
+
+            // Limit compiled templates cache
+            if (EZPrompt.cache.compiledTemplates.size > maxCacheSize) {
+                const entries = Array.from(EZPrompt.cache.compiledTemplates.entries());
+                const toRemove = entries.slice(0, entries.length - maxCacheSize);
+                toRemove.forEach(([key]) => {
+                    EZPrompt.cache.compiledTemplates.delete(key);
+                });
+            }
+        }
+
+        cleanupEventListeners() {
+            // Clean up tracked event listeners for removed elements
+            const listenersToRemove = [];
+
+            for (const listener of EZPrompt.cleanup.eventListeners) {
+                if (listener.element && !document.contains(listener.element)) {
+                    listenersToRemove.push(listener);
+                }
+            }
+
+            listenersToRemove.forEach(listener => {
+                if (listener.element && listener.event && listener.handler) {
+                    listener.element.removeEventListener(listener.event, listener.handler);
+                }
+                EZPrompt.cleanup.eventListeners.delete(listener);
+            });
+        }
+
+        checkMemoryUsage() {
+            if ('memory' in performance) {
+                const memInfo = performance.memory;
+                const usedMemory = memInfo.usedJSHeapSize;
+
+                if (usedMemory > this.memoryThreshold) {
+                    this.logger.warn(`High memory usage detected: ${(usedMemory / 1024 / 1024).toFixed(2)}MB`);
+                    this.performAggressiveCleanup();
+                }
+            }
+        }
+
+        performAggressiveCleanup() {
+            this.logger.info('Performing aggressive cleanup due to high memory usage');
+
+            // Clear all caches
+            EZPrompt.cache.searchResults.clear();
+            EZPrompt.cache.compiledTemplates.clear();
+            EZPrompt.cache.selectorValidation.clear();
+
+            // Clear all cache maps
+            for (const cache of Object.values(EZPrompt.cache)) {
+                if (cache && typeof cache.clear === 'function') {
+                    cache.clear();
+                }
+            }
+
+            // Force garbage collection if available
+            if (window.gc) {
+                window.gc();
+            }
+        }
+
+        cleanup() {
+            this.logger.debug('Cleaning up memory manager');
+
+            // Clear cleanup interval
+            if (this.cleanupInterval) {
+                clearInterval(this.cleanupInterval);
+                EZPrompt.cleanup.intervals.delete(this.cleanupInterval);
+            }
+
+            // Clear all timeouts
+            EZPrompt.cleanup.timeouts.forEach(timeout => {
+                clearTimeout(timeout);
+            });
+            EZPrompt.cleanup.timeouts.clear();
+
+            // Clear all intervals
+            EZPrompt.cleanup.intervals.forEach(interval => {
+                clearInterval(interval);
+            });
+            EZPrompt.cleanup.intervals.clear();
+
+            // Disconnect all observers
+            EZPrompt.cleanup.observers.forEach(observer => {
+                if (observer.disconnect) {
+                    observer.disconnect();
+                }
+            });
+            EZPrompt.cleanup.observers.clear();
+
+            // Remove all tracked event listeners
+            EZPrompt.cleanup.eventListeners.forEach(listener => {
+                if (listener.element && listener.event && listener.handler) {
+                    listener.element.removeEventListener(listener.event, listener.handler);
+                }
+            });
+            EZPrompt.cleanup.eventListeners.clear();
+
+            // Clear all caches
+            EZPrompt.cache.searchResults.clear();
+            EZPrompt.cache.compiledTemplates.clear();
+            EZPrompt.cache.selectorValidation.clear();
+        }
+    }
+
+    // Memory manager is now initialized inside initializeCore after logger setup
+
+    // Enhanced event listener helper with cleanup tracking
+    function addTrackedEventListener(element, event, handler, options) {
+        element.addEventListener(event, handler, options);
+        EZPrompt.cleanup.eventListeners.add({
+            element,
+            event,
+            handler,
+            options
+        });
+    }
+
+    // Enhanced observer helper with cleanup tracking
+    function createTrackedObserver(ObserverClass, callback, options) {
+        const observer = new ObserverClass(callback, options);
+        EZPrompt.cleanup.observers.add(observer);
+        return observer;
+    }
+
+    // Production build optimization
+    class ProductionOptimizer {
+        static minifyCSS(css) {
+            return css
+                .replace(/\/\*[\s\S]*?\*\//g, '') // Remove comments
+                .replace(/\s+/g, ' ') // Collapse whitespace
+                .replace(/;\s*}/g, '}') // Remove unnecessary semicolons
+                .replace(/\s*{\s*/g, '{') // Clean up braces
+                .replace(/\s*}\s*/g, '}')
+                .replace(/\s*,\s*/g, ',') // Clean up commas
+                .replace(/\s*:\s*/g, ':') // Clean up colons
+                .trim();
+        }
+
+        static optimizeSelectors(selectors) {
+            // Remove duplicate selectors and optimize for performance
+            const uniqueSelectors = [...new Set(selectors)];
+
+            // Sort by specificity (more specific selectors first)
+            return uniqueSelectors.sort((a, b) => {
+                const aSpecificity = (a.match(/#/g) || []).length * 100 +
+                    (a.match(/\./g) || []).length * 10 +
+                    (a.match(/\[/g) || []).length * 5;
+                const bSpecificity = (b.match(/#/g) || []).length * 100 +
+                    (b.match(/\./g) || []).length * 10 +
+                    (b.match(/\[/g) || []).length * 5;
+                return bSpecificity - aSpecificity;
+            });
+        }
+
+        static createOptimizedSearchFunction(searchFn) {
+            const memoizedSearch = PerformanceUtils.memoize(searchFn);
+            const debouncedSearch = PerformanceUtils.debounce(memoizedSearch, 150);
+
+            return function (query, options = {}) {
+                // Use cached results for exact matches
+                const cacheKey = `${query}:${JSON.stringify(options)}`;
+                const cached = EZPrompt.cache.searchResults.get(cacheKey);
+
+                if (cached && Date.now() - cached.timestamp < 30000) {
+                    return cached.results;
+                }
+
+                const results = debouncedSearch(query, options);
+
+                // Cache results
+                EZPrompt.cache.searchResults.set(cacheKey, {
+                    results,
+                    timestamp: Date.now()
+                });
+
+                return results;
+            };
+        }
+    }
+
+    // Expose EZPrompt to global scope for debugging (in debug mode only)
+    if (EZPrompt.debug) {
+        window.EZPrompt = EZPrompt;
+    }
+
+    // Start initialization
+    initialize();
+
+})();

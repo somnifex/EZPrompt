@@ -1,0 +1,26 @@
+{
+  "buildTime": "2025-08-27T05:19:59.108Z",
+  "source": {
+    "file": "ezprompt.user.js",
+    "size": 401012,
+    "sizeFormatted": "391.61 KB"
+  },
+  "output": {
+    "file": "ezprompt.min.user.js",
+    "size": 243638,
+    "sizeFormatted": "237.93 KB"
+  },
+  "compression": {
+    "ratio": 39.24421214327751,
+    "savedBytes": 157374,
+    "savedBytesFormatted": "153.69 KB"
+  },
+  "optimizations": [
+    "Production mode enabled",
+    "Debug logging removed",
+    "CSS minification",
+    "JavaScript minification",
+    "String optimization",
+    "Metadata updates"
+  ]
+}
