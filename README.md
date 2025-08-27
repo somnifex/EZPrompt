@@ -2,7 +2,8 @@
 
 # EZPrompt
 
-`<strong>`Universal AI Chat Prompt Manager (Userscript)`</strong><br/>`
+<strong>Universal AI Chat Prompt Manager (Userscript)</strong>
+<br/>
 Manage, search, and insert reusable prompt templates seamlessly across multiple AI chat platforms.
 
 [English](README.md) · [简体中文](README_CN.md)
